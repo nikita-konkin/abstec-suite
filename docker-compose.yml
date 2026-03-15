@@ -1,0 +1,30 @@
+services:
+  abstec:
+    build: .
+    image: abstec-suite:latest
+    volumes:
+      - ${ABSTEC_INPUT_ROOT:-./in}:/data/in:ro
+      - ./TayAbsTEC_24.04.17:/data/workdir
+      - ${ABSTEC_OUTPUT_ROOT:-./out}/${YEAR:-2026}:/data/workdir/${YEAR:-2026}
+    environment:
+      YEAR: ${YEAR:-2026}
+      DAY_OF_YEAR: ${DAY_OF_YEAR:-1}
+      SITE: ${SITE:-aksu}
+      DRY_RUN: ${DRY_RUN:-1}
+      RUNNER: ${RUNNER:-auto}
+    entrypoint:
+      - sh
+      - -lc
+      - >
+        DRY_RUN_ARG="";
+        if [ "$$DRY_RUN" = "1" ] || [ "$$DRY_RUN" = "true" ] || [ "$$DRY_RUN" = "yes" ]; then
+          DRY_RUN_ARG="--dry-run";
+        fi;
+        exec python /app/run_absoltec.py
+        --workdir /data/workdir
+        --dat-path /data/in
+        --year "$$YEAR"
+        --day-of-year "$$DAY_OF_YEAR"
+        --site "$$SITE"
+        --runner "$$RUNNER"
+        $$DRY_RUN_ARG

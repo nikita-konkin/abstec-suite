@@ -1,0 +1,2 @@
+# This project currently uses only Python standard library modules.
+# Keep this file for tooling compatibility (pip, CI, Docker workflows).

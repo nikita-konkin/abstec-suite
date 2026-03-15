@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import platform
+import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -10,6 +13,29 @@ def normalize_dat_path(dat_path: str) -> str:
     if not normalized.endswith(("\\", "/")):
         normalized = normalized + "\\"
     return normalized
+
+
+def should_use_wine(exe_path: Path, runner: str) -> bool:
+    if runner == "wine":
+        return True
+    if runner == "direct":
+        return False
+    if platform.system() == "Windows":
+        return False
+    return exe_path.suffix.lower() == ".exe"
+
+
+def is_windows_path(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z]:[\\/]", value.strip()))
+
+
+def to_wine_windows_path(path_value: str) -> str:
+    if is_windows_path(path_value):
+        return path_value
+
+    path_obj = Path(path_value).expanduser().resolve()
+    posix_path = path_obj.as_posix().lstrip("/")
+    return f"Z:\\{posix_path.replace('/', '\\\\')}"
 
 
 def build_dia_content(
@@ -56,7 +82,7 @@ def update_dia_file(
     dia_path.write_text(dia_content, encoding="utf-8")
 
 
-def find_matching_dat_files(dat_path: Path, site: str, day_of_year: int, year: int) -> list[Path]:
+def find_matching_dat_files(dat_path: Path, site: str, day_of_year: int, year: int) -> tuple[list[Path], str]:
     # pattern = f"{site}_*_{day_of_year:03d}_{year % 100:02d}.dat"
     pattern = f"{''.join(site[:4])}_*_{day_of_year:03d}_{year % 100:02d}.dat"
     return sorted(dat_path.glob(pattern)), pattern
@@ -88,7 +114,7 @@ def resolve_station_data_folder(dat_root: Path, site: str, day_of_year: int, yea
     return exact_path
 
 
-def validate_dat_inputs(dat_path: Path, site: str, day_of_year: int, year: int) -> None:
+def validate_dat_inputs(dat_path: Path, site: str, day_of_year: int, year: int) -> Path:
     station_folder = resolve_station_data_folder(dat_path, site, day_of_year, year)
     if not station_folder.exists():
         raise FileNotFoundError(
@@ -143,12 +169,99 @@ def validate_dat_inputs(dat_path: Path, site: str, day_of_year: int, year: int) 
             "TayAbsTEC cannot proceed. Re-export tec-suite data with a valid tec.p1p2/tec.c1p2 column."
         )
 
+    return station_folder
 
-def run_absoltec(exe_path: Path) -> None:
+
+def find_wine_binary() -> str | None:
+    wine_path = shutil.which("wine") or shutil.which("wine64")
+    if wine_path:
+        return wine_path
+
+    known_paths = [
+        Path("/usr/lib/wine/wine"),
+        Path("/usr/lib/wine/wine64"),
+        Path("/opt/homebrew/bin/wine64"),
+        Path("/opt/homebrew/bin/wine"),
+        Path("/usr/local/bin/wine"),
+        Path("/usr/local/bin/wine64"),
+    ]
+    for candidate in known_paths:
+        if candidate.exists():
+            return str(candidate)
+
+    return None
+
+
+def resolve_runner_command(exe_path: Path, runner: str) -> list[str]:
+    if runner == "direct":
+        return [str(exe_path)]
+
+    if runner == "wine":
+        wine_path = find_wine_binary()
+        if not wine_path:
+            raise RuntimeError(
+                "Wine is required to run Windows binaries on this OS but was not found. "
+                "Install wine/wine64 or use --runner direct with a native executable."
+            )
+        validate_wine_runtime(wine_path)
+        return [wine_path, str(exe_path)]
+
+    if runner != "auto":
+        raise ValueError("--runner must be one of: auto, direct, wine")
+
+    if platform.system() == "Windows":
+        return [str(exe_path)]
+
+    if exe_path.suffix.lower() == ".exe":
+        wine_path = find_wine_binary()
+        if not wine_path:
+            raise RuntimeError(
+                "Detected Windows executable on non-Windows OS. "
+                "Install wine/wine64 or pass --runner direct if this is a native binary."
+            )
+        validate_wine_runtime(wine_path)
+        return [wine_path, str(exe_path)]
+
+    return [str(exe_path)]
+
+
+def validate_wine_runtime(wine_path: str) -> None:
+    check = subprocess.run(
+        [wine_path, "--version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    if check.returncode == 0:
+        return
+
+    if check.returncode < 0:
+        signal_number = -check.returncode
+        if signal_number == 9:
+            raise RuntimeError(
+                "Wine runtime check failed: wine was terminated by SIGKILL while running '--version'. "
+                "On macOS this is often caused by Gatekeeper quarantine or incompatible Wine install. "
+                "Try: xattr -dr com.apple.quarantine /Applications/Wine\\ Stable.app, "
+                "then re-run; also verify Rosetta on Apple Silicon."
+            )
+        raise RuntimeError(
+            f"Wine runtime check failed: wine terminated by signal {signal_number}."
+        )
+
+    stderr_text = (check.stderr or "").strip()
+    stdout_text = (check.stdout or "").strip()
+    details = stderr_text or stdout_text or "unknown wine startup failure"
+    raise RuntimeError(f"Wine runtime check failed: {details}")
+
+
+def run_absoltec(exe_path: Path, runner: str) -> None:
+    command = resolve_runner_command(exe_path, runner)
+
     result = subprocess.run(
-        [str(exe_path)],
+        command,
         cwd=str(exe_path.parent),
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
@@ -157,6 +270,24 @@ def run_absoltec(exe_path: Path) -> None:
         print(result.stdout, end="")
     if result.stderr:
         print(result.stderr, end="")
+
+    if result.returncode != 0:
+        base_error = (
+            f"absolTEC process failed (return code {result.returncode}). "
+            f"Command: {' '.join(command)}"
+        )
+        if result.returncode < 0:
+            signal_number = -result.returncode
+            base_error = (
+                f"absolTEC process was terminated by signal {signal_number}. "
+                f"Command: {' '.join(command)}"
+            )
+            if signal_number == 9 and "wine" in Path(command[0]).name.lower():
+                base_error += (
+                    " Wine was killed by SIGKILL. Try running Wine manually once to initialize, "
+                    "ensure Rosetta is installed on Apple Silicon, and check macOS security prompts/logs."
+                )
+        raise RuntimeError(base_error)
 
     combined_output = f"{result.stdout}\n{result.stderr}".lower()
     if "error, no files" in combined_output:
@@ -188,6 +319,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only edit absolTEC.dia without running absolTEC.exe",
     )
+    parser.add_argument(
+        "--runner",
+        choices=["auto", "direct", "wine"],
+        default="auto",
+        help="How to launch absolTEC executable (default: auto)",
+    )
     return parser.parse_args()
 
 
@@ -205,22 +342,26 @@ def main() -> None:
         raise FileNotFoundError(f"Work directory not found: {workdir}")
     if not dia_path.exists():
         raise FileNotFoundError(f"absolTEC.dia not found: {dia_path}")
-    if not exe_path.exists():
+    if not args.dry_run and not exe_path.exists():
         raise FileNotFoundError(f"absolTEC.exe not found: {exe_path}")
 
     dat_path_obj = Path(args.dat_path)
     if not dat_path_obj.exists():
         raise FileNotFoundError(f"Data path not found: {dat_path_obj}")
 
-    validate_dat_inputs(dat_path_obj, args.site, args.day_of_year, args.year)
+    resolved_station_folder = validate_dat_inputs(dat_path_obj, args.site, args.day_of_year, args.year)
+
+    dat_path_for_dia = args.dat_path
+    if should_use_wine(exe_path, args.runner):
+        dat_path_for_dia = to_wine_windows_path(args.dat_path)
 
     update_dia_file(
         dia_path=dia_path,
-        dat_path=args.dat_path,
+        dat_path=dat_path_for_dia,
         elevation_cutoff=args.elevation_cutoff,
         year=args.year,
         day_of_year=args.day_of_year,
-        site=args.site,
+        site=resolved_station_folder.name,
         time_step_hours=args.time_step_hours,
         correction_coefficient=args.correction_coefficient,
     )
@@ -230,7 +371,7 @@ def main() -> None:
         print("Dry run enabled. Skipping absolTEC.exe execution.")
         return
 
-    run_absoltec(exe_path)
+    run_absoltec(exe_path, args.runner)
     print(f"Finished: {exe_path}")
 
 
