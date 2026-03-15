@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import platform
 import re
+import signal
 import shutil
 import subprocess
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_dat_path(dat_path: str) -> str:
@@ -255,29 +261,62 @@ def validate_wine_runtime(wine_path: str) -> None:
     raise RuntimeError(f"Wine runtime check failed: {details}")
 
 
-def run_absoltec(exe_path: Path, runner: str) -> None:
-    command = resolve_runner_command(exe_path, runner)
+def _kill_wine_process_group(proc: subprocess.Popen) -> None:
+    """Send SIGKILL to the entire process group so winedbg and other Wine children are terminated."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
-    result = subprocess.run(
+
+def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = None) -> None:
+    command = resolve_runner_command(exe_path, runner)
+    logger.info("Starting absolTEC execution: %s", " ".join(command))
+    logger.info("absolTEC working directory: %s", exe_path.parent)
+
+    proc = subprocess.Popen(
         command,
         cwd=str(exe_path.parent),
-        check=False,
-        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
 
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.stderr:
-        print(result.stderr, end="")
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        _kill_wine_process_group(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = exc.stdout or "", exc.stderr or ""
+        output_hint = ""
+        combined = f"{stdout}\n{stderr}".strip()
+        if combined:
+            output_hint = f" Last output: {combined[-400:]}"
+        raise RuntimeError(
+            f"absolTEC did not finish within {timeout_seconds} seconds. "
+            f"Command: {' '.join(command)}."
+            f"{output_hint}"
+        ) from exc
 
-    if result.returncode != 0:
+    if stdout:
+        logger.info(stdout.rstrip("\n"))
+    if stderr:
+        logger.error(stderr.rstrip("\n"))
+
+    if proc.returncode != 0:
         base_error = (
-            f"absolTEC process failed (return code {result.returncode}). "
+            f"absolTEC process failed (return code {proc.returncode}). "
             f"Command: {' '.join(command)}"
         )
-        if result.returncode < 0:
-            signal_number = -result.returncode
+        if proc.returncode < 0:
+            signal_number = -proc.returncode
             base_error = (
                 f"absolTEC process was terminated by signal {signal_number}. "
                 f"Command: {' '.join(command)}"
@@ -289,7 +328,7 @@ def run_absoltec(exe_path: Path, runner: str) -> None:
                 )
         raise RuntimeError(base_error)
 
-    combined_output = f"{result.stdout}\n{result.stderr}".lower()
+    combined_output = f"{stdout}\n{stderr}".lower()
     if "error, no files" in combined_output:
         raise RuntimeError("absolTEC reported 'Error, no files'. Check DAT_PATH and input files.")
 
@@ -325,10 +364,17 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="How to launch absolTEC executable (default: auto)",
     )
+    parser.add_argument(
+        "--execution-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("EXECUTION_TIMEOUT_SECONDS", "300")),
+        help="Max wait time for absolTEC process before failing (set 0 to disable).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
 
     if not (1 <= args.day_of_year <= 366):
@@ -365,14 +411,18 @@ def main() -> None:
         time_step_hours=args.time_step_hours,
         correction_coefficient=args.correction_coefficient,
     )
-    print(f"Updated: {dia_path}")
+    logger.info("Updated: %s", dia_path)
 
     if args.dry_run:
-        print("Dry run enabled. Skipping absolTEC.exe execution.")
+        logger.info("Dry run enabled. Skipping absolTEC.exe execution.")
         return
 
-    run_absoltec(exe_path, args.runner)
-    print(f"Finished: {exe_path}")
+    timeout_seconds: float | None = args.execution_timeout_seconds
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        timeout_seconds = None
+
+    run_absoltec(exe_path, args.runner, timeout_seconds=timeout_seconds)
+    logger.info("Finished: %s", exe_path)
 
 
 if __name__ == "__main__":

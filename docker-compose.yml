@@ -12,10 +12,14 @@ services:
       SITE: ${SITE:-aksu}
       DRY_RUN: ${DRY_RUN:-1}
       RUNNER: ${RUNNER:-auto}
+      EXECUTION_TIMEOUT_SECONDS: ${EXECUTION_TIMEOUT_SECONDS:-300}
     entrypoint:
       - sh
       - -lc
       - >
+        Xvfb :0 -screen 0 1024x768x16 -ac &
+        sleep 1;
+        export DISPLAY=:0;
         DRY_RUN_ARG="";
         if [ "$$DRY_RUN" = "1" ] || [ "$$DRY_RUN" = "true" ] || [ "$$DRY_RUN" = "yes" ]; then
           DRY_RUN_ARG="--dry-run";
@@ -27,4 +31,5 @@ services:
         --day-of-year "$$DAY_OF_YEAR"
         --site "$$SITE"
         --runner "$$RUNNER"
+        --execution-timeout-seconds "$$EXECUTION_TIMEOUT_SECONDS"
         $$DRY_RUN_ARG

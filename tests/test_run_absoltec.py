@@ -1,8 +1,9 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from subprocess import CompletedProcess
-from unittest.mock import patch
+from subprocess import CompletedProcess, TimeoutExpired
+from unittest.mock import MagicMock, patch
 
 from run_absoltec import (
     build_dia_content,
@@ -12,6 +13,7 @@ from run_absoltec import (
     resolve_runner_command,
     should_use_wine,
     to_wine_windows_path,
+    run_absoltec,
     update_dia_file,
     validate_wine_runtime,
     validate_dat_inputs,
@@ -192,6 +194,35 @@ class RunAbsoltecTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 validate_wine_runtime("/opt/homebrew/bin/wine")
+
+    def test_run_absoltec_passes_timeout_to_subprocess(self) -> None:
+        exe_path = Path("/tmp/absolTEC.exe")
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("ok", "")
+        mock_proc.returncode = 0
+        with (
+            patch("run_absoltec.resolve_runner_command", return_value=["wine", str(exe_path)]),
+            patch("run_absoltec.subprocess.Popen", return_value=mock_proc),
+        ):
+            run_absoltec(exe_path, "wine", timeout_seconds=30)
+
+        mock_proc.communicate.assert_called_once_with(timeout=30)
+
+    def test_run_absoltec_timeout_raises_runtime_error(self) -> None:
+        exe_path = Path("/tmp/absolTEC.exe")
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.communicate.side_effect = [
+            TimeoutExpired(cmd=["wine", str(exe_path)], timeout=5),
+            ("", ""),
+        ]
+        with (
+            patch("run_absoltec.resolve_runner_command", return_value=["wine", str(exe_path)]),
+            patch("run_absoltec.subprocess.Popen", return_value=mock_proc),
+            patch("run_absoltec._kill_wine_process_group"),
+        ):
+            with self.assertRaises(RuntimeError):
+                run_absoltec(exe_path, "wine", timeout_seconds=5)
 
 
 if __name__ == "__main__":

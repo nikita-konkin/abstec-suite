@@ -153,6 +153,12 @@ Dry run is enabled by default in Compose (`DRY_RUN=1`). Disable it with:
 docker compose run --rm -e DRY_RUN=0 -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu abstec
 ```
 
+Set a max run time (seconds) to avoid indefinite hangs if Wine enters a debug/wait state:
+
+```powershell
+docker compose run --rm -e DRY_RUN=0 -e RUNNER=wine -e EXECUTION_TIMEOUT_SECONDS=900 -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu abstec
+```
+
 If your station folders are named like `aksu0010`, pass the exact folder name in `SITE`:
 
 ```powershell
