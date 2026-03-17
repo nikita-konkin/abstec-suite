@@ -73,6 +73,7 @@ Useful options:
 - `--elevation-cutoff 10`
 - `--time-step-hours 0.5`
 - `--correction-coefficient 0.97`
+- `--output-dir out` (move generated results from workdir into a dedicated folder)
 - `--dry-run` (updates `.dia` only, skips `.exe` execution)
 
 ### 2. Generate launchers for all stations on a date
@@ -100,20 +101,24 @@ This repository includes:
 - `docker-compose.yml`
 - `.dockerignore`
 
+`TayAbsTEC_24.04.17` is copied into the image at build time and used as `/data/workdir` at runtime.
+
 Build image:
 
 ```powershell
-docker build -t abstec-suite:latest .
+docker build --platform linux/amd64 -t abstec-suite:latest .
 ```
 
-By default, Docker Compose also mounts a host output folder for the selected year:
+On Apple Silicon Macs, keep the image and container on `linux/amd64`. TayAbsTEC ships as a 32-bit x86 Windows executable, and native `arm64` Linux containers will not run it correctly under Wine.
+
+By default, Docker Compose mounts a host output folder to `/data/out`:
 
 ```text
-./out/<YEAR> -> /data/workdir/<YEAR>
+./out -> /data/out
 ```
 
-That matches TayAbsTEC's behavior when it writes results into a folder named after the year from `absolTEC.dia`.
-You can change the host-side base folder with `ABSTEC_OUTPUT_ROOT`.
+`run_absoltec.py` can move generated results (for example `/data/workdir/<YEAR>`) into `/data/out` after execution.
+You can change the host-side base folder with `ABSTEC_OUTPUT_ROOT`, or override in-container destination with `OUTPUT_DIR`.
 
 Docker Compose also lets you override the host input folder mounted to `/data/in`:
 
@@ -126,11 +131,11 @@ Run one dry-run job (recommended in container):
 ```powershell
 docker run --rm `
   -v "${PWD}\in:/data/in:ro" `
-  -v "${PWD}\TayAbsTEC_24.04.17:/data/workdir" `
-  -v "${PWD}\out\2026:/data/workdir/2026" `
+  -v "${PWD}\out:/data/out" `
   abstec-suite:latest `
   --workdir /data/workdir `
   --dat-path /data/in `
+  --output-dir /data/out `
   --year 2026 `
   --day-of-year 1 `
   --site aksu `
@@ -145,7 +150,9 @@ docker compose run --rm -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu abstec
 
 `YEAR`, `DAY_OF_YEAR`, and `SITE` are read inside the container at runtime, so overriding them with `docker compose run -e ...` works as expected.
 
-`RUNNER` is also configurable (`auto`, `wine`, `direct`). In Linux containers, use `auto` or `wine`.
+The Compose service is pinned to `linux/amd64` so Apple Silicon Macs run the Wine environment under Docker's x86_64 emulation instead of a native `arm64` container.
+
+`RUNNER` is also configurable (`auto`, `wine`, `direct`). The default in this container is `wine`.
 
 Dry run is enabled by default in Compose (`DRY_RUN=1`). Disable it with:
 
@@ -172,7 +179,7 @@ $env:ABSTEC_OUTPUT_ROOT = "${PWD}\results"
 docker compose run --rm -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu abstec
 ```
 
-That will persist TayAbsTEC output under `results\2026` on the host.
+That will persist moved TayAbsTEC output under `results` on the host.
 
 Use a custom input location on the host:
 
@@ -185,10 +192,35 @@ That will mount `D:\tec-suite\exports` to `/data/in` in the container.
 
 Important limitation:
 
-- The provided image is Linux-based (`python:3.12-slim`).
-- `absolTEC.exe` is a Windows executable; the image installs Wine (`wine64`) so it can be executed from the Linux container.
+- The provided image is Linux-based (`python:3.12.13-slim`).
+- `absolTEC.exe` is a Windows executable; the image installs Wine so it can be executed from the Linux container.
+- `absolTEC.exe` is a 32-bit Windows executable, so the image has to install 32-bit Wine support (`wine32:i386`) and must run as `linux/amd64` on Apple Silicon.
+- On Docker Desktop for macOS, that package install can be memory-heavy during `docker build`.
+- If the image build fails with `ResourceExhausted` or `cannot allocate memory`, increase Docker Desktop memory first. In practice, `6 GB` is a safer minimum and `8 GB` is more reliable.
 - The first non-dry run can be slower while Wine initializes.
 - If Wine is not desired, keep `DRY_RUN=1` and run `absolTEC.exe` directly on Windows.
+- Some TayAbsTEC executable builds may still fail under Linux Wine with errors such as `ShellExecuteEx failed: Not enough memory` or `wine: failed to start ...`. In that case, treat container execution as unsupported for non-dry runs on that host and execute `absolTEC.exe` on native Windows.
+
+If you see this exact runtime error:
+
+```text
+Application could not be started, or no application associated with the specified file.
+ShellExecuteEx failed: Not enough memory.
+wine: failed to start L"Z:\\...\\absolTEC.exe"
+```
+
+it usually means Wine itself is installed but this specific TayAbsTEC build is not compatible with the current Linux Wine runtime (commonly seen on macOS Docker Desktop when running `linux/amd64` emulation for 32-bit Windows binaries).
+
+Quick verification inside container:
+
+```powershell
+docker compose run --rm --entrypoint sh abstec -lc "wine --version && wine cmd /c echo ok"
+```
+
+If that command succeeds but `absolTEC.exe` still fails, use this split workflow:
+
+1. Run container in `DRY_RUN=1` mode to validate inputs and rewrite `absolTEC.dia`.
+2. Execute `absolTEC.exe` on native Windows for production runs.
 
 If you need to execute `absolTEC.exe`, run `run_absoltec.py` directly on Windows (without `--dry-run`).
 

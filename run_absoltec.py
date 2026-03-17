@@ -261,6 +261,28 @@ def validate_wine_runtime(wine_path: str) -> None:
     raise RuntimeError(f"Wine runtime check failed: {details}")
 
 
+def validate_runtime_architecture(exe_path: Path, runner: str) -> None:
+    if not should_use_wine(exe_path, runner):
+        return
+
+    if platform.system() != "Linux":
+        return
+
+    machine = platform.machine().lower()
+    if machine not in {"arm64", "aarch64"}:
+        return
+
+    if exe_path.suffix.lower() != ".exe":
+        return
+
+    raise RuntimeError(
+        "Detected Linux arm64 runtime for a Windows .exe. "
+        "This TayAbsTEC binary is 32-bit x86 and cannot run reliably in a native arm64 Wine container. "
+        "Rebuild/run the container as linux/amd64, for example with Docker Compose platform=linux/amd64 or "
+        "'docker build --platform linux/amd64 -t abstec-suite:latest .', or run absolTEC.exe directly on Windows."
+    )
+
+
 def _kill_wine_process_group(proc: subprocess.Popen) -> None:
     """Send SIGKILL to the entire process group so winedbg and other Wine children are terminated."""
     try:
@@ -273,6 +295,7 @@ def _kill_wine_process_group(proc: subprocess.Popen) -> None:
 
 
 def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = None) -> None:
+    validate_runtime_architecture(exe_path, runner)
     command = resolve_runner_command(exe_path, runner)
     logger.info("Starting absolTEC execution: %s", " ".join(command))
     logger.info("absolTEC working directory: %s", exe_path.parent)
@@ -315,6 +338,17 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
             f"absolTEC process failed (return code {proc.returncode}). "
             f"Command: {' '.join(command)}"
         )
+        combined_output = f"{stdout}\n{stderr}".lower()
+        if (
+            "shellexecuteex failed: not enough memory" in combined_output
+            or "failed to start l\"z:" in combined_output
+            or "c0000135" in combined_output
+        ):
+            base_error += (
+                " Wine failed to start this executable in the current Linux container runtime. "
+                "This is often a Wine compatibility issue for this specific binary (not actual host RAM exhaustion). "
+                "Use --dry-run in container and run absolTEC.exe directly on Windows for production execution."
+            )
         if proc.returncode < 0:
             signal_number = -proc.returncode
             base_error = (
@@ -331,6 +365,63 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
     combined_output = f"{stdout}\n{stderr}".lower()
     if "error, no files" in combined_output:
         raise RuntimeError("absolTEC reported 'Error, no files'. Check DAT_PATH and input files.")
+
+
+def capture_workdir_state(workdir: Path) -> dict[str, int]:
+    state: dict[str, int] = {}
+    for item in workdir.iterdir():
+        if item.name in {"absolTEC.exe", "absolTEC.dia"}:
+            continue
+        try:
+            state[item.name] = item.stat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+    return state
+
+
+def _move_with_merge(src: Path, dst: Path) -> None:
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        for child in src.iterdir():
+            _move_with_merge(child, dst / child.name)
+        try:
+            src.rmdir()
+        except OSError:
+            pass
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    shutil.move(str(src), str(dst))
+
+
+def move_absoltec_results(workdir: Path, output_dir: Path, year: int, before_state: dict[str, int]) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    year_dir = workdir / str(year)
+    candidates: list[Path] = []
+    if year_dir.exists():
+        candidates.append(year_dir)
+    else:
+        for item in workdir.iterdir():
+            if item.name in {"absolTEC.exe", "absolTEC.dia"}:
+                continue
+            previous_mtime = before_state.get(item.name)
+            try:
+                current_mtime = item.stat().st_mtime_ns
+            except FileNotFoundError:
+                continue
+            if previous_mtime is None or current_mtime != previous_mtime:
+                candidates.append(item)
+
+    moved: list[Path] = []
+    for candidate in candidates:
+        destination = output_dir / candidate.name
+        _move_with_merge(candidate, destination)
+        moved.append(destination)
+
+    return moved
 
 
 def parse_args() -> argparse.Namespace:
@@ -369,6 +460,10 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.environ.get("EXECUTION_TIMEOUT_SECONDS", "300")),
         help="Max wait time for absolTEC process before failing (set 0 to disable).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Optional directory where generated absolTEC results are moved after execution.",
     )
     return parser.parse_args()
 
@@ -421,8 +516,20 @@ def main() -> None:
     if timeout_seconds is not None and timeout_seconds <= 0:
         timeout_seconds = None
 
+    before_state = capture_workdir_state(workdir) if args.output_dir else {}
     run_absoltec(exe_path, args.runner, timeout_seconds=timeout_seconds)
     logger.info("Finished: %s", exe_path)
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir).resolve()
+        moved_paths = move_absoltec_results(workdir, output_dir, args.year, before_state)
+        if moved_paths:
+            logger.info(
+                "Moved result paths to output directory: %s",
+                ", ".join(str(path) for path in moved_paths),
+            )
+        else:
+            logger.info("No generated result files were detected to move.")
 
 
 if __name__ == "__main__":

@@ -1,35 +1,19 @@
 services:
   abstec:
+    platform: linux/amd64
     build: .
     image: abstec-suite:latest
+    shm_size: "1gb"
     volumes:
       - ${ABSTEC_INPUT_ROOT:-./in}:/data/in:ro
-      - ./TayAbsTEC_24.04.17:/data/workdir
-      - ${ABSTEC_OUTPUT_ROOT:-./out}/${YEAR:-2026}:/data/workdir/${YEAR:-2026}
+      - ${ABSTEC_OUTPUT_ROOT:-./out}:/data/out
     environment:
       YEAR: ${YEAR:-2026}
       DAY_OF_YEAR: ${DAY_OF_YEAR:-1}
       SITE: ${SITE:-aksu}
+      OUTPUT_DIR: ${OUTPUT_DIR:-/data/out}
       DRY_RUN: ${DRY_RUN:-1}
-      RUNNER: ${RUNNER:-auto}
-      EXECUTION_TIMEOUT_SECONDS: ${EXECUTION_TIMEOUT_SECONDS:-300}
-    entrypoint:
-      - sh
-      - -lc
-      - >
-        Xvfb :0 -screen 0 1024x768x16 -ac &
-        sleep 1;
-        export DISPLAY=:0;
-        DRY_RUN_ARG="";
-        if [ "$$DRY_RUN" = "1" ] || [ "$$DRY_RUN" = "true" ] || [ "$$DRY_RUN" = "yes" ]; then
-          DRY_RUN_ARG="--dry-run";
-        fi;
-        exec python /app/run_absoltec.py
-        --workdir /data/workdir
-        --dat-path /data/in
-        --year "$$YEAR"
-        --day-of-year "$$DAY_OF_YEAR"
-        --site "$$SITE"
-        --runner "$$RUNNER"
-        --execution-timeout-seconds "$$EXECUTION_TIMEOUT_SECONDS"
-        $$DRY_RUN_ARG
+      RUNNER: ${RUNNER:-wine}
+      EXECUTION_TIMEOUT_SECONDS: ${EXECUTION_TIMEOUT_SECONDS:-900}
+      WINEDEBUG: ${WINEDEBUG:--all}
+      PYTHONUNBUFFERED: "1"

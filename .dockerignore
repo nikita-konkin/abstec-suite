@@ -7,6 +7,6 @@ __pycache__/
 *.log
 in/
 tests/
-TayAbsTEC_24.04.17/
+# TayAbsTEC_24.04.17/
 TayAbsTEC_24.04.17.zip
 launchers/

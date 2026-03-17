@@ -1,31 +1,37 @@
-FROM python:3.12-slim
+FROM python:3.12.13-slim
+
 WORKDIR /app
+
 ENV WINEDEBUG=-all
 ENV WINEPREFIX=/wine
-ENV WINEARCH=win64
+ENV WINEARCH=win32
 ENV DISPLAY=:0
 ENV XDG_RUNTIME_DIR=/tmp/runtime-root
+ENV PYTHONUNBUFFERED=1
+
+COPY requirements.txt /app/requirements.txt
+
+RUN python -m pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r /app/requirements.txt
 
 RUN dpkg --add-architecture i386 \
  && apt-get update -o Acquire::Retries=5 -o Acquire::http::Timeout=30 \
  && apt-get install -y --no-install-recommends \
-        wine \
-        wine32:i386 \
-        wine64 \
-        winbind \
+        ca-certificates \
         cabextract \
         fonts-wine \
         xvfb \
- && mkdir -p $WINEPREFIX \
- && mkdir -p /tmp/runtime-root \
+        wine \
+        wine32:i386 \
+ && mkdir -p "$WINEPREFIX" /tmp/runtime-root \
  && chmod 700 /tmp/runtime-root \
- && sh -c 'Xvfb :0 -screen 0 1024x768x16 &' \
- && sleep 2 \
- && wineboot --init \
- && wine reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' /v Debugger /t REG_SZ /d "" /f \
- && wine reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' /v Auto /t REG_SZ /d "1" /f \
  && rm -rf /var/lib/apt/lists/*
 
-COPY run_absoltec.py generate_absoltec_launchers.py /app/
-ENTRYPOINT ["python", "/app/run_absoltec.py"]
-CMD ["--help"]
+COPY run_absoltec.py /app/
+COPY entrypoint.sh /app/entrypoint.sh
+COPY TayAbsTEC_24.04.17 /data/workdir
+
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD []

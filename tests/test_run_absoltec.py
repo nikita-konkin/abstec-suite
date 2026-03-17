@@ -7,8 +7,10 @@ from unittest.mock import MagicMock, patch
 
 from run_absoltec import (
     build_dia_content,
+    capture_workdir_state,
     find_wine_binary,
     is_windows_path,
+    move_absoltec_results,
     normalize_dat_path,
     resolve_runner_command,
     should_use_wine,
@@ -132,6 +134,7 @@ class RunAbsoltecTests(unittest.TestCase):
         with (
             patch("run_absoltec.platform.system", return_value="Darwin"),
             patch("run_absoltec.shutil.which", return_value=None),
+            patch("run_absoltec.Path.exists", return_value=False),
         ):
             with self.assertRaises(RuntimeError):
                 resolve_runner_command(exe_path, "auto")
@@ -147,7 +150,10 @@ class RunAbsoltecTests(unittest.TestCase):
 
     def test_resolve_runner_command_explicit_wine_without_wine_raises(self) -> None:
         exe_path = Path("/tmp/absolTEC.exe")
-        with patch("run_absoltec.shutil.which", return_value=None):
+        with (
+            patch("run_absoltec.shutil.which", return_value=None),
+            patch("run_absoltec.Path.exists", return_value=False),
+        ):
             with self.assertRaises(RuntimeError):
                 resolve_runner_command(exe_path, "wine")
 
@@ -162,6 +168,8 @@ class RunAbsoltecTests(unittest.TestCase):
             mock_exists.side_effect = fake_exists
             found = find_wine_binary()
 
+        if found is None:
+            self.fail("Expected wine fallback path to be detected")
         self.assertEqual(found.replace("\\", "/"), "/usr/lib/wine/wine")
 
     def test_resolve_runner_command_explicit_wine_uses_known_path_fallback(self) -> None:
@@ -186,6 +194,15 @@ class RunAbsoltecTests(unittest.TestCase):
             return_value=CompletedProcess(args=["wine", "--version"], returncode=0, stdout="wine-9.0", stderr=""),
         ):
             validate_wine_runtime("/opt/homebrew/bin/wine")
+
+    def test_run_absoltec_linux_arm64_exe_raises_clear_error(self) -> None:
+        exe_path = Path("/tmp/absolTEC.exe")
+        with (
+            patch("run_absoltec.platform.system", return_value="Linux"),
+            patch("run_absoltec.platform.machine", return_value="arm64"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "linux/amd64"):
+                run_absoltec(exe_path, "wine")
 
     def test_validate_wine_runtime_sigkill_raises(self) -> None:
         with patch(
@@ -223,6 +240,52 @@ class RunAbsoltecTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 run_absoltec(exe_path, "wine", timeout_seconds=5)
+
+    def test_capture_workdir_state_ignores_binary_and_dia(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workdir = Path(temp_dir)
+            (workdir / "absolTEC.exe").write_text("x", encoding="utf-8")
+            (workdir / "absolTEC.dia").write_text("x", encoding="utf-8")
+            (workdir / "2026").mkdir()
+
+            state = capture_workdir_state(workdir)
+
+        self.assertNotIn("absolTEC.exe", state)
+        self.assertNotIn("absolTEC.dia", state)
+        self.assertIn("2026", state)
+
+    def test_move_absoltec_results_moves_year_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "work"
+            output = root / "output"
+            year_dir = workdir / "2026"
+            year_dir.mkdir(parents=True)
+            (year_dir / "result.txt").write_text("ok", encoding="utf-8")
+
+            moved = move_absoltec_results(workdir, output, 2026, before_state={})
+
+            self.assertEqual([path.name for path in moved], ["2026"])
+            self.assertTrue((output / "2026" / "result.txt").exists())
+            self.assertFalse((workdir / "2026" / "result.txt").exists())
+
+    def test_move_absoltec_results_uses_changed_items_when_year_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "work"
+            output = root / "output"
+            workdir.mkdir(parents=True)
+            log_file = workdir / "absolTEC.log"
+            log_file.write_text("v1", encoding="utf-8")
+
+            before = capture_workdir_state(workdir)
+            log_file.write_text("v2", encoding="utf-8")
+
+            moved = move_absoltec_results(workdir, output, 2026, before_state=before)
+
+            self.assertEqual([path.name for path in moved], ["absolTEC.log"])
+            self.assertTrue((output / "absolTEC.log").exists())
+            self.assertFalse(log_file.exists())
 
 
 if __name__ == "__main__":
