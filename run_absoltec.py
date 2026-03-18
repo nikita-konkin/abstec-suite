@@ -14,6 +14,83 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def parse_days_list(days_value: str) -> list[int]:
+    days: list[int] = []
+    for token in days_value.split(","):
+        part = token.strip()
+        if not part:
+            continue
+
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if start > end:
+                raise ValueError(f"Invalid day range '{part}': start must be <= end")
+            for day in range(start, end + 1):
+                if not (1 <= day <= 366):
+                    raise ValueError(f"Day out of range in --days: {day}")
+                days.append(day)
+            continue
+
+        day = int(part)
+        if not (1 <= day <= 366):
+            raise ValueError(f"Day out of range in --days: {day}")
+        days.append(day)
+
+    if not days:
+        raise ValueError("--days did not contain any valid day values")
+
+    seen: set[int] = set()
+    unique_days: list[int] = []
+    for day in days:
+        if day in seen:
+            continue
+        seen.add(day)
+        unique_days.append(day)
+    return unique_days
+
+
+def _matching_dat_file_names(station_dir: Path, site_prefix: str, day_of_year: int, year: int) -> set[str]:
+    pattern = f"{site_prefix}_*_{day_of_year:03d}_{year % 100:02d}.dat"
+    return {path.name.lower() for path in station_dir.glob(pattern)}
+
+
+def discover_stations_for_day(dat_root: Path, year: int, day_of_year: int) -> list[str]:
+    day_root = dat_root / str(year) / f"{day_of_year:03d}"
+    if not day_root.exists():
+        return []
+
+    station_names = sorted(path.name for path in day_root.iterdir() if path.is_dir())
+    station_dirs = {path.name.lower(): path for path in day_root.iterdir() if path.is_dir()}
+
+    filtered_names: list[str] = []
+    for name in station_names:
+        name_lower = name.lower()
+        if len(name) == 4:
+            short_dir = station_dirs[name_lower]
+            short_files = _matching_dat_file_names(short_dir, name_lower, day_of_year, year)
+            if short_files:
+                for other_name, other_dir in station_dirs.items():
+                    if other_name == name_lower or not other_name.startswith(name_lower):
+                        continue
+                    other_files = _matching_dat_file_names(other_dir, name_lower, day_of_year, year)
+                    if other_files == short_files:
+                        logger.info(
+                            "Skipping duplicate prefix-only station folder '%s' because station '%s' has the same matched DAT files",
+                            name,
+                            other_dir.name,
+                        )
+                        break
+                else:
+                    filtered_names.append(name)
+                    continue
+                continue
+        filtered_names.append(name)
+
+    return filtered_names
+
+
 def normalize_dat_path(dat_path: str) -> str:
     normalized = dat_path.strip()
     if not normalized.endswith(("\\", "/")):
@@ -396,6 +473,34 @@ def _move_with_merge(src: Path, dst: Path) -> None:
     shutil.move(str(src), str(dst))
 
 
+def rename_station_output(output_dir: Path, year: int, site: str) -> Path | None:
+    site_prefix = site[:4]
+    if site_prefix == site:
+        return None
+    year_dir = output_dir / str(year)
+    src = year_dir / site_prefix
+    dst = year_dir / site
+    if src.exists() and not dst.exists():
+        src.rename(dst)
+        return dst
+    return None
+
+
+def organize_station_output_by_day(output_dir: Path, year: int, day_of_year: int, site: str) -> Path | None:
+    year_dir = output_dir / str(year)
+    site_dir = year_dir / site
+    if not site_dir.exists():
+        return None
+
+    day_dir = year_dir / f"{day_of_year:03d}"
+    destination = day_dir / site
+    if destination == site_dir:
+        return destination
+
+    _move_with_merge(site_dir, destination)
+    return destination
+
+
 def move_absoltec_results(workdir: Path, output_dir: Path, year: int, before_state: dict[str, int]) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -424,6 +529,72 @@ def move_absoltec_results(workdir: Path, output_dir: Path, year: int, before_sta
     return moved
 
 
+def run_single_station(
+    *,
+    workdir: Path,
+    dia_path: Path,
+    exe_path: Path,
+    dat_path_obj: Path,
+    output_dir: Path | None,
+    year: int,
+    day_of_year: int,
+    site: str,
+    elevation_cutoff: float,
+    time_step_hours: float,
+    correction_coefficient: float,
+    dry_run: bool,
+    runner: str,
+    execution_timeout_seconds: float,
+    organize_by_day: bool,
+) -> None:
+    validate_dat_inputs(dat_path_obj, site, day_of_year, year)
+
+    dat_path_for_dia = str(dat_path_obj)
+    if should_use_wine(exe_path, runner):
+        dat_path_for_dia = to_wine_windows_path(str(dat_path_obj))
+
+    update_dia_file(
+        dia_path=dia_path,
+        dat_path=dat_path_for_dia,
+        elevation_cutoff=elevation_cutoff,
+        year=year,
+        day_of_year=day_of_year,
+        site=site,
+        time_step_hours=time_step_hours,
+        correction_coefficient=correction_coefficient,
+    )
+    logger.info("Updated: %s", dia_path)
+
+    if dry_run:
+        logger.info("Dry run enabled. Skipping absolTEC.exe execution.")
+        return
+
+    timeout_seconds: float | None = execution_timeout_seconds
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        timeout_seconds = None
+
+    before_state = capture_workdir_state(workdir) if output_dir else {}
+    run_absoltec(exe_path, runner, timeout_seconds=timeout_seconds)
+    logger.info("Finished: %s", exe_path)
+
+    if output_dir:
+        moved_paths = move_absoltec_results(workdir, output_dir, year, before_state)
+        if moved_paths:
+            logger.info(
+                "Moved result paths to output directory: %s",
+                ", ".join(str(path) for path in moved_paths),
+            )
+        else:
+            logger.info("No generated result files were detected to move.")
+        renamed = rename_station_output(output_dir, year, site)
+        if renamed:
+            logger.info("Renamed station output folder to: %s", renamed)
+        if organize_by_day:
+            organized = organize_station_output_by_day(output_dir, year, day_of_year, site)
+            if organized:
+                logger.info("Organized station output under day folder: %s", organized)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Edit absolTEC.dia and run absolTEC.exe"
@@ -440,8 +611,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--elevation-cutoff", type=float, default=10.0)
     parser.add_argument("--year", type=int, required=True)
-    parser.add_argument("--day-of-year", type=int, required=True)
-    parser.add_argument("--site", required=True)
+    parser.add_argument("--day-of-year", type=int)
+    parser.add_argument("--site")
+    parser.add_argument(
+        "--days",
+        help="Comma-separated list/ranges of days (e.g. 001,002,010-015). When set, all stations for each day are processed.",
+    )
     parser.add_argument("--time-step-hours", type=float, default=0.5)
     parser.add_argument("--correction-coefficient", type=float, default=0.97)
     parser.add_argument(
@@ -472,8 +647,20 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
 
-    if not (1 <= args.day_of_year <= 366):
-        raise ValueError("--day-of-year must be in range 1..366")
+    if args.days:
+        if args.day_of_year is not None:
+            raise ValueError("Use either --day-of-year or --days, not both")
+        if args.site is not None:
+            raise ValueError("--site cannot be used with --days (stations are auto-discovered)")
+        days_to_process = parse_days_list(args.days)
+    else:
+        if args.day_of_year is None:
+            raise ValueError("--day-of-year is required when --days is not provided")
+        if args.site is None:
+            raise ValueError("--site is required when --days is not provided")
+        if not (1 <= args.day_of_year <= 366):
+            raise ValueError("--day-of-year must be in range 1..366")
+        days_to_process = [args.day_of_year]
 
     workdir = Path(args.workdir).resolve()
     dia_path = workdir / "absolTEC.dia"
@@ -490,46 +677,81 @@ def main() -> None:
     if not dat_path_obj.exists():
         raise FileNotFoundError(f"Data path not found: {dat_path_obj}")
 
-    resolved_station_folder = validate_dat_inputs(dat_path_obj, args.site, args.day_of_year, args.year)
+    resolved_output_dir = Path(args.output_dir).resolve() if args.output_dir else None
 
-    dat_path_for_dia = args.dat_path
-    if should_use_wine(exe_path, args.runner):
-        dat_path_for_dia = to_wine_windows_path(args.dat_path)
+    if args.days:
+        total_runs = 0
+        skipped_runs = 0
+        for day_of_year in days_to_process:
+            stations = discover_stations_for_day(dat_path_obj, args.year, day_of_year)
+            if not stations:
+                logger.warning("No station folders found for %s/%03d", args.year, day_of_year)
+                continue
 
-    update_dia_file(
-        dia_path=dia_path,
-        dat_path=dat_path_for_dia,
-        elevation_cutoff=args.elevation_cutoff,
-        year=args.year,
-        day_of_year=args.day_of_year,
-        site=resolved_station_folder.name,
-        time_step_hours=args.time_step_hours,
-        correction_coefficient=args.correction_coefficient,
-    )
-    logger.info("Updated: %s", dia_path)
+            for site in stations:
+                total_runs += 1
+                logger.info("Processing year=%s day=%03d site=%s", args.year, day_of_year, site)
+                try:
+                    run_single_station(
+                        workdir=workdir,
+                        dia_path=dia_path,
+                        exe_path=exe_path,
+                        dat_path_obj=dat_path_obj,
+                        output_dir=resolved_output_dir,
+                        year=args.year,
+                        day_of_year=day_of_year,
+                        site=site,
+                        elevation_cutoff=args.elevation_cutoff,
+                        time_step_hours=args.time_step_hours,
+                        correction_coefficient=args.correction_coefficient,
+                        dry_run=args.dry_run,
+                        runner=args.runner,
+                        execution_timeout_seconds=args.execution_timeout_seconds,
+                        organize_by_day=True,
+                    )
+                except FileNotFoundError as exc:
+                    skipped_runs += 1
+                    logger.warning(
+                        "Skipping year=%s day=%03d site=%s due to missing input files: %s",
+                        args.year,
+                        day_of_year,
+                        site,
+                        exc,
+                    )
+                except ValueError as exc:
+                    skipped_runs += 1
+                    logger.warning(
+                        "Skipping year=%s day=%03d site=%s due to invalid input data: %s",
+                        args.year,
+                        day_of_year,
+                        site,
+                        exc,
+                    )
 
-    if args.dry_run:
-        logger.info("Dry run enabled. Skipping absolTEC.exe execution.")
+        logger.info(
+            "Batch run complete. Total station runs: %s, skipped: %s",
+            total_runs,
+            skipped_runs,
+        )
         return
 
-    timeout_seconds: float | None = args.execution_timeout_seconds
-    if timeout_seconds is not None and timeout_seconds <= 0:
-        timeout_seconds = None
-
-    before_state = capture_workdir_state(workdir) if args.output_dir else {}
-    run_absoltec(exe_path, args.runner, timeout_seconds=timeout_seconds)
-    logger.info("Finished: %s", exe_path)
-
-    if args.output_dir:
-        output_dir = Path(args.output_dir).resolve()
-        moved_paths = move_absoltec_results(workdir, output_dir, args.year, before_state)
-        if moved_paths:
-            logger.info(
-                "Moved result paths to output directory: %s",
-                ", ".join(str(path) for path in moved_paths),
-            )
-        else:
-            logger.info("No generated result files were detected to move.")
+    run_single_station(
+        workdir=workdir,
+        dia_path=dia_path,
+        exe_path=exe_path,
+        dat_path_obj=dat_path_obj,
+        output_dir=resolved_output_dir,
+        year=args.year,
+        day_of_year=args.day_of_year,
+        site=args.site,
+        elevation_cutoff=args.elevation_cutoff,
+        time_step_hours=args.time_step_hours,
+        correction_coefficient=args.correction_coefficient,
+        dry_run=args.dry_run,
+        runner=args.runner,
+        execution_timeout_seconds=args.execution_timeout_seconds,
+        organize_by_day=False,
+    )
 
 
 if __name__ == "__main__":

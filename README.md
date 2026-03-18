@@ -44,6 +44,24 @@ Examples:
 
 `run_absoltec.py` resolves station folders with fallback matching (exact site, then prefix matching).
 
+## Station Naming and Output Folder
+
+The `SITE` value (passed via `--site` or the `SITE` environment variable) controls both input resolution and the final output folder name.
+
+`absolTEC.exe` internally truncates the station name to its first 4 characters when naming its output folder, so it always creates `<YEAR>/<4-char-prefix>/` regardless of what was written to `absolTEC.dia`. For example, with `SITE=aksu0010` the executable produces `2026/aksu/`.
+
+After `absolTEC.exe` finishes and results are moved to `--output-dir`, `run_absoltec.py` automatically renames that folder to the full `SITE` value:
+
+```text
+out/2026/aksu/  →  out/2026/aksu0010/
+```
+
+This means:
+
+- Pass the full station identifier (e.g. `aksu0010`) in `SITE` — no manual renaming needed.
+- If `SITE` is already 4 characters (e.g. `aksu`), no rename step occurs.
+- If the destination folder (`out/2026/aksu0010/`) already exists, the rename is skipped to avoid overwriting previous results.
+
 ## Requirements
 
 - Windows
@@ -75,6 +93,31 @@ Useful options:
 - `--correction-coefficient 0.97`
 - `--output-dir out` (move generated results from workdir into a dedicated folder)
 - `--dry-run` (updates `.dia` only, skips `.exe` execution)
+
+### 1b. Run all stations for multiple days
+
+You can pass a day list and process every station folder found under each day:
+
+```powershell
+python run_absoltec.py `
+  --dat-path in `
+  --year 2026 `
+  --days 001,002,003,004 `
+  --output-dir out
+```
+
+`--days` also supports ranges, for example:
+
+```powershell
+python run_absoltec.py --dat-path in --year 2026 --days 001-365 --output-dir out
+```
+
+Batch mode behavior:
+
+- `--days` and `--day-of-year` are mutually exclusive.
+- When `--days` is used, stations are auto-discovered from `in/YYYY/DDD/*` and `--site` is not used.
+- The script runs `absolTEC.exe` once per discovered station for each listed day.
+- In batch mode, output is organized as `out/YYYY/DDD/STATION` (for example `out/2026/001/aksu0010`).
 
 ### 2. Generate launchers for all stations on a date
 
@@ -148,7 +191,27 @@ Run with Docker Compose:
 docker compose run --rm -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu abstec
 ```
 
+Set DIA time step via Docker option `TIME_STEP_HOURS` (maps to `--time-step-hours`):
+
+```powershell
+docker compose run --rm -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu -e TIME_STEP_HOURS=0.5 abstec
+```
+
 `YEAR`, `DAY_OF_YEAR`, and `SITE` are read inside the container at runtime, so overriding them with `docker compose run -e ...` works as expected.
+
+For batch mode (all stations for multiple days), pass `DAYS`:
+
+```powershell
+docker compose run --rm -e YEAR=2026 -e DAYS=001,002,003,004 -e DRY_RUN=0 abstec
+```
+
+`DAYS` also supports ranges:
+
+```powershell
+docker compose run --rm -e YEAR=2026 -e DAYS=001-365 -e DRY_RUN=0 abstec
+```
+
+When `DAYS` is set, the container passes `--days` to `run_absoltec.py` and does not pass `--day-of-year` or `--site`.
 
 The Compose service is pinned to `linux/amd64` so Apple Silicon Macs run the Wine environment under Docker's x86_64 emulation instead of a native `arm64` container.
 
@@ -166,7 +229,7 @@ Set a max run time (seconds) to avoid indefinite hangs if Wine enters a debug/wa
 docker compose run --rm -e DRY_RUN=0 -e RUNNER=wine -e EXECUTION_TIMEOUT_SECONDS=900 -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu abstec
 ```
 
-If your station folders are named like `aksu0010`, pass the exact folder name in `SITE`:
+If your station folders are named like `aksu0010`, pass the exact folder name in `SITE`. The output folder will be automatically renamed from the 4-char prefix (`aksu`) to the full name (`aksu0010`) — see [Station Naming and Output Folder](#station-naming-and-output-folder):
 
 ```powershell
 docker compose run --rm -e DRY_RUN=0 -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu0010 abstec

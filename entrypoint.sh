@@ -43,8 +43,10 @@ if [ "$#" -gt 0 ]; then
 fi
 
 YEAR="${YEAR:-2026}"
+DAYS="${DAYS:-}"
 DAY_OF_YEAR="${DAY_OF_YEAR:-1}"
 SITE="${SITE:-aksu}"
+TIME_STEP_HOURS="${TIME_STEP_HOURS:-0.5}"
 RUNNER="${RUNNER:-wine}"
 EXECUTION_TIMEOUT_SECONDS="${EXECUTION_TIMEOUT_SECONDS:-900}"
 DRY_RUN="${DRY_RUN:-1}"
@@ -54,11 +56,16 @@ set -- \
 	--workdir /data/workdir \
 	--dat-path /data/in \
 	--year "$YEAR" \
-	--day-of-year "$DAY_OF_YEAR" \
-	--site "$SITE" \
+	--time-step-hours "$TIME_STEP_HOURS" \
 	--runner "$RUNNER" \
 	--execution-timeout-seconds "$EXECUTION_TIMEOUT_SECONDS" \
 	--output-dir "$OUTPUT_DIR"
+
+if [ -n "$DAYS" ]; then
+	set -- "$@" --days "$DAYS"
+else
+	set -- "$@" --day-of-year "$DAY_OF_YEAR" --site "$SITE"
+fi
 
 case "$(printf '%s' "$DRY_RUN" | tr '[:upper:]' '[:lower:]')" in
 	1|true|yes)

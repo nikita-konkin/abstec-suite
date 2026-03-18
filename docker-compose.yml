@@ -9,8 +9,10 @@ services:
       - ${ABSTEC_OUTPUT_ROOT:-./out}:/data/out
     environment:
       YEAR: ${YEAR:-2026}
+      DAYS: ${DAYS:-}
       DAY_OF_YEAR: ${DAY_OF_YEAR:-1}
       SITE: ${SITE:-aksu}
+      TIME_STEP_HOURS: ${TIME_STEP_HOURS:-0.5}
       OUTPUT_DIR: ${OUTPUT_DIR:-/data/out}
       DRY_RUN: ${DRY_RUN:-1}
       RUNNER: ${RUNNER:-wine}
