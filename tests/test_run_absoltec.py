@@ -9,6 +9,7 @@ from run_absoltec import (
     build_dia_content,
     capture_workdir_state,
     discover_stations_for_day,
+    extract_progress_counters,
     find_wine_binary,
     is_windows_path,
     move_absoltec_results,
@@ -27,6 +28,27 @@ from run_absoltec import (
 
 
 class RunAbsoltecTests(unittest.TestCase):
+    def test_extract_progress_counters_parses_completed_fraction(self) -> None:
+        output = "INFO: Completed 2618 / 15221\nother text"
+
+        parsed = extract_progress_counters(output)
+
+        self.assertEqual(parsed, (2618, 15221))
+
+    def test_extract_progress_counters_parses_percent_progress(self) -> None:
+        output = "INFO: Progress: 17%\nother text"
+
+        parsed = extract_progress_counters(output)
+
+        self.assertEqual(parsed, (17, 100))
+
+    def test_extract_progress_counters_returns_last_counter_when_both_formats_present(self) -> None:
+        output = "Completed 5 / 10\nProgress: 50%"
+
+        parsed = extract_progress_counters(output)
+
+        self.assertEqual(parsed, (50, 100))
+
     def test_parse_days_list_supports_csv_and_ranges(self) -> None:
         parsed = parse_days_list("001, 002, 010-012")
         self.assertEqual(parsed, [1, 2, 10, 11, 12])

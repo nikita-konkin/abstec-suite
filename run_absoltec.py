@@ -14,6 +14,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+PROGRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Example: "INFO: Completed 2618 / 15221"
+    re.compile(r"Completed\s+(\d+)\s*/\s*(\d+)", flags=re.IGNORECASE),
+    # Example: "INFO: Progress: 17%"
+    re.compile(r"Progress:\s*(\d{1,3})\s*%", flags=re.IGNORECASE),
+)
+
+
 def parse_days_list(days_value: str) -> list[int]:
     days: list[int] = []
     for token in days_value.split(","):
@@ -89,6 +97,18 @@ def discover_stations_for_day(dat_root: Path, year: int, day_of_year: int) -> li
         filtered_names.append(name)
 
     return filtered_names
+
+
+def build_station_run_plan(dat_root: Path, year: int, days_to_process: list[int]) -> list[tuple[int, str]]:
+    plan: list[tuple[int, str]] = []
+    for day_of_year in days_to_process:
+        stations = discover_stations_for_day(dat_root, year, day_of_year)
+        if not stations:
+            logger.warning("No station folders found for %s/%03d", year, day_of_year)
+            continue
+        for site in stations:
+            plan.append((day_of_year, site))
+    return plan
 
 
 def normalize_dat_path(dat_path: str) -> str:
@@ -360,6 +380,27 @@ def validate_runtime_architecture(exe_path: Path, runner: str) -> None:
     )
 
 
+def extract_progress_counters(output_text: str) -> tuple[int, int] | None:
+    latest_counter: tuple[int, int] | None = None
+
+    for line in output_text.splitlines():
+        completed_match = PROGRESS_PATTERNS[0].search(line)
+        if completed_match:
+            done = int(completed_match.group(1))
+            total = int(completed_match.group(2))
+            if total > 0:
+                latest_counter = (done, total)
+            continue
+
+        percent_match = PROGRESS_PATTERNS[1].search(line)
+        if percent_match:
+            percent = int(percent_match.group(1))
+            percent = max(0, min(percent, 100))
+            latest_counter = (percent, 100)
+
+    return latest_counter
+
+
 def _kill_wine_process_group(proc: subprocess.Popen) -> None:
     """Send SIGKILL to the entire process group so winedbg and other Wine children are terminated."""
     try:
@@ -409,6 +450,11 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
         logger.info(stdout.rstrip("\n"))
     if stderr:
         logger.error(stderr.rstrip("\n"))
+
+    combined_streams = "\n".join(part for part in (stdout, stderr) if part)
+    progress_counter = extract_progress_counters(combined_streams)
+    if progress_counter:
+        logger.info("Progress counter: %s / %s", progress_counter[0], progress_counter[1])
 
     if proc.returncode != 0:
         base_error = (
@@ -680,53 +726,58 @@ def main() -> None:
     resolved_output_dir = Path(args.output_dir).resolve() if args.output_dir else None
 
     if args.days:
-        total_runs = 0
+        station_run_plan = build_station_run_plan(dat_path_obj, args.year, days_to_process)
+        total_runs = len(station_run_plan)
         skipped_runs = 0
-        for day_of_year in days_to_process:
-            stations = discover_stations_for_day(dat_path_obj, args.year, day_of_year)
-            if not stations:
-                logger.warning("No station folders found for %s/%03d", args.year, day_of_year)
-                continue
+        for run_index, (day_of_year, site) in enumerate(station_run_plan, start=1):
+            logger.info(
+                "Processing year=%s day=%03d site=%s (%s/%s)",
+                args.year,
+                day_of_year,
+                site,
+                run_index,
+                total_runs,
+            )
+            try:
+                run_single_station(
+                    workdir=workdir,
+                    dia_path=dia_path,
+                    exe_path=exe_path,
+                    dat_path_obj=dat_path_obj,
+                    output_dir=resolved_output_dir,
+                    year=args.year,
+                    day_of_year=day_of_year,
+                    site=site,
+                    elevation_cutoff=args.elevation_cutoff,
+                    time_step_hours=args.time_step_hours,
+                    correction_coefficient=args.correction_coefficient,
+                    dry_run=args.dry_run,
+                    runner=args.runner,
+                    execution_timeout_seconds=args.execution_timeout_seconds,
+                    organize_by_day=True,
+                )
+            except FileNotFoundError as exc:
+                skipped_runs += 1
+                logger.warning(
+                    "Skipping year=%s day=%03d site=%s due to missing input files: %s",
+                    args.year,
+                    day_of_year,
+                    site,
+                    exc,
+                )
+            except ValueError as exc:
+                skipped_runs += 1
+                logger.warning(
+                    "Skipping year=%s day=%03d site=%s due to invalid input data: %s",
+                    args.year,
+                    day_of_year,
+                    site,
+                    exc,
+                )
 
-            for site in stations:
-                total_runs += 1
-                logger.info("Processing year=%s day=%03d site=%s", args.year, day_of_year, site)
-                try:
-                    run_single_station(
-                        workdir=workdir,
-                        dia_path=dia_path,
-                        exe_path=exe_path,
-                        dat_path_obj=dat_path_obj,
-                        output_dir=resolved_output_dir,
-                        year=args.year,
-                        day_of_year=day_of_year,
-                        site=site,
-                        elevation_cutoff=args.elevation_cutoff,
-                        time_step_hours=args.time_step_hours,
-                        correction_coefficient=args.correction_coefficient,
-                        dry_run=args.dry_run,
-                        runner=args.runner,
-                        execution_timeout_seconds=args.execution_timeout_seconds,
-                        organize_by_day=True,
-                    )
-                except FileNotFoundError as exc:
-                    skipped_runs += 1
-                    logger.warning(
-                        "Skipping year=%s day=%03d site=%s due to missing input files: %s",
-                        args.year,
-                        day_of_year,
-                        site,
-                        exc,
-                    )
-                except ValueError as exc:
-                    skipped_runs += 1
-                    logger.warning(
-                        "Skipping year=%s day=%03d site=%s due to invalid input data: %s",
-                        args.year,
-                        day_of_year,
-                        site,
-                        exc,
-                    )
+            percent = round(run_index * 100 / total_runs)
+            logger.info("Completed %s / %s", run_index, total_runs)
+            logger.info("Progress: %s%%", percent)
 
         logger.info(
             "Batch run complete. Total station runs: %s, skipped: %s",
@@ -752,6 +803,8 @@ def main() -> None:
         execution_timeout_seconds=args.execution_timeout_seconds,
         organize_by_day=False,
     )
+    logger.info("Completed 1 / 1")
+    logger.info("Progress: 100%")
 
 
 if __name__ == "__main__":
