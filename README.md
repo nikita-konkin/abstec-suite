@@ -50,10 +50,10 @@ The `SITE` value (passed via `--site` or the `SITE` environment variable) contro
 
 `absolTEC.exe` internally truncates the station name to its first 4 characters when naming its output folder, so it always creates `<YEAR>/<4-char-prefix>/` regardless of what was written to `absolTEC.dia`. For example, with `SITE=aksu0010` the executable produces `2026/aksu/`.
 
-After `absolTEC.exe` finishes and results are moved to `--output-dir`, `run_absoltec.py` automatically renames that folder to the full `SITE` value:
+After `absolTEC.exe` finishes and results are moved to `--output-dir`, `run_absoltec.py` automatically renames that folder to the full `SITE` value and organizes it under the day folder:
 
 ```text
-out/2026/aksu/  →  out/2026/aksu0010/
+out/2026/aksu/  →  out/2026/001/aksu0010/
 ```
 
 This means:
@@ -161,12 +161,12 @@ By default, Docker Compose mounts a host output folder to `/data/out`:
 ```
 
 `run_absoltec.py` can move generated results (for example `/data/workdir/<YEAR>`) into `/data/out` after execution.
-You can change the host-side base folder with `ABSTEC_OUTPUT_ROOT`, or override in-container destination with `OUTPUT_DIR`.
+You can change the host-side base folder with `ABSTEC_OUTPUT_DATA_PATH`, or override in-container destination with `OUTPUT_DIR`.
 
 Docker Compose also lets you override the host input folder mounted to `/data/in`:
 
 ```text
-ABSTEC_INPUT_ROOT -> /data/in
+ABSTEC_INPUT_DATA_PATH -> /data/in
 ```
 
 Run one dry-run job (recommended in container):
@@ -235,10 +235,18 @@ If your station folders are named like `aksu0010`, pass the exact folder name in
 docker compose run --rm -e DRY_RUN=0 -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu0010 abstec
 ```
 
+For a single day, you can run multiple explicit stations by passing a comma-separated `SITE` list:
+
+```powershell
+docker compose run --rm -e DRY_RUN=0 -e YEAR=2026 -e DAY_OF_YEAR=7 -e SITE=aksu0070,alks0070,bala0070 abstec
+```
+
+That runs stations one by one and writes separate output folders (for example `out/2026/007/aksu0070`, `out/2026/007/alks0070`, `out/2026/007/bala0070`).
+
 Use a custom output location on the host:
 
 ```powershell
-$env:ABSTEC_OUTPUT_ROOT = "${PWD}\results"
+$env:ABSTEC_OUTPUT_DATA_PATH = "${PWD}\results"
 docker compose run --rm -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu abstec
 ```
 
@@ -247,7 +255,7 @@ That will persist moved TayAbsTEC output under `results` on the host.
 Use a custom input location on the host:
 
 ```powershell
-$env:ABSTEC_INPUT_ROOT = "D:\tec-suite\exports"
+$env:ABSTEC_INPUT_DATA_PATH = "D:\tec-suite\exports"
 docker compose run --rm -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu abstec
 ```
 

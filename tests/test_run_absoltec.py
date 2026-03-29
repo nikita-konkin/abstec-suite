@@ -1,6 +1,7 @@
 import subprocess
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
 from unittest.mock import MagicMock, patch
@@ -16,10 +17,12 @@ from run_absoltec import (
     normalize_dat_path,
     organize_station_output_by_day,
     parse_days_list,
+    parse_sites_list,
     rename_station_output,
     resolve_runner_command,
     should_use_wine,
     to_wine_windows_path,
+    main,
     run_absoltec,
     update_dia_file,
     validate_wine_runtime,
@@ -60,6 +63,15 @@ class RunAbsoltecTests(unittest.TestCase):
     def test_parse_days_list_rejects_invalid_range(self) -> None:
         with self.assertRaises(ValueError):
             parse_days_list("005-002")
+
+    def test_parse_sites_list_supports_csv_and_deduplicates(self) -> None:
+        parsed = parse_sites_list("aksu0070, alks0070,aksu0070,bala0070")
+
+        self.assertEqual(parsed, ["aksu0070", "alks0070", "bala0070"])
+
+    def test_parse_sites_list_rejects_empty_values(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_sites_list(" ,  , ")
 
     def test_discover_stations_for_day_returns_sorted_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -430,6 +442,130 @@ class RunAbsoltecTests(unittest.TestCase):
             self.assertEqual([path.name for path in moved], ["absolTEC.log"])
             self.assertTrue((output / "absolTEC.log").exists())
             self.assertFalse(log_file.exists())
+
+    def test_main_single_day_with_csv_site_runs_each_station(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "work"
+            dat_path = root / "in"
+            output_dir = root / "out"
+            workdir.mkdir(parents=True)
+            dat_path.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            (workdir / "absolTEC.dia").write_text("x", encoding="utf-8")
+            (workdir / "absolTEC.exe").write_text("x", encoding="utf-8")
+
+            args = Namespace(
+                workdir=str(workdir),
+                dat_path=str(dat_path),
+                year=2026,
+                day_of_year=7,
+                site="aksu0070,alks0070,bala0070",
+                days=None,
+                elevation_cutoff=10.0,
+                time_step_hours=0.5,
+                correction_coefficient=0.97,
+                dry_run=False,
+                runner="wine",
+                execution_timeout_seconds=900,
+                output_dir=str(output_dir),
+            )
+
+            with (
+                patch("run_absoltec.parse_args", return_value=args),
+                patch("run_absoltec.run_single_station") as mock_run_single_station,
+            ):
+                main()
+
+        self.assertEqual(mock_run_single_station.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["site"] for call in mock_run_single_station.call_args_list],
+            ["aksu0070", "alks0070", "bala0070"],
+        )
+        self.assertTrue(
+            all(call.kwargs["organize_by_day"] for call in mock_run_single_station.call_args_list)
+        )
+
+    def test_main_single_day_with_csv_site_trims_and_deduplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "work"
+            dat_path = root / "in"
+            output_dir = root / "out"
+            workdir.mkdir(parents=True)
+            dat_path.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            (workdir / "absolTEC.dia").write_text("x", encoding="utf-8")
+            (workdir / "absolTEC.exe").write_text("x", encoding="utf-8")
+
+            args = Namespace(
+                workdir=str(workdir),
+                dat_path=str(dat_path),
+                year=2026,
+                day_of_year=7,
+                site=" aksu0070 , alks0070 ,aksu0070 ",
+                days=None,
+                elevation_cutoff=10.0,
+                time_step_hours=0.5,
+                correction_coefficient=0.97,
+                dry_run=False,
+                runner="wine",
+                execution_timeout_seconds=900,
+                output_dir=str(output_dir),
+            )
+
+            with (
+                patch("run_absoltec.parse_args", return_value=args),
+                patch("run_absoltec.run_single_station") as mock_run_single_station,
+            ):
+                main()
+
+        self.assertEqual(mock_run_single_station.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["site"] for call in mock_run_single_station.call_args_list],
+            ["aksu0070", "alks0070"],
+        )
+        self.assertTrue(
+            all(call.kwargs["organize_by_day"] for call in mock_run_single_station.call_args_list)
+        )
+
+    def test_main_single_day_with_single_site_organizes_output_by_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "work"
+            dat_path = root / "in"
+            output_dir = root / "out"
+            workdir.mkdir(parents=True)
+            dat_path.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            (workdir / "absolTEC.dia").write_text("x", encoding="utf-8")
+            (workdir / "absolTEC.exe").write_text("x", encoding="utf-8")
+
+            args = Namespace(
+                workdir=str(workdir),
+                dat_path=str(dat_path),
+                year=2026,
+                day_of_year=7,
+                site="aksu0070",
+                days=None,
+                elevation_cutoff=10.0,
+                time_step_hours=0.5,
+                correction_coefficient=0.97,
+                dry_run=False,
+                runner="wine",
+                execution_timeout_seconds=900,
+                output_dir=str(output_dir),
+            )
+
+            with (
+                patch("run_absoltec.parse_args", return_value=args),
+                patch("run_absoltec.run_single_station") as mock_run_single_station,
+            ):
+                main()
+
+        self.assertEqual(mock_run_single_station.call_count, 1)
+        self.assertEqual(mock_run_single_station.call_args.kwargs["site"], "aksu0070")
+        self.assertTrue(mock_run_single_station.call_args.kwargs["organize_by_day"])
 
 
 if __name__ == "__main__":

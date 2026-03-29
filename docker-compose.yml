@@ -4,9 +4,11 @@ services:
     build: .
     image: abstec-suite:latest
     shm_size: "1gb"
+    env_file:
+      - .env
     volumes:
-      - ${ABSTEC_INPUT_ROOT:-./in}:/data/in:ro
-      - ${ABSTEC_OUTPUT_ROOT:-./out}:/data/out
+      - ${ABSTEC_INPUT_DATA_PATH_HOST}:${ABSTEC_INPUT_DATA_PATH:-/data/in}:ro
+      - ${ABSTEC_OUTPUT_DATA_PATH_HOST}:${ABSTEC_OUTPUT_DATA_PATH:-/data/out}:rw
     environment:
       YEAR: ${YEAR:-2026}
       DAYS: ${DAYS:-}

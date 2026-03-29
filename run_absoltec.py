@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import platform
@@ -20,6 +21,16 @@ PROGRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Example: "INFO: Progress: 17%"
     re.compile(r"Progress:\s*(\d{1,3})\s*%", flags=re.IGNORECASE),
 )
+
+
+def _workdir_item_signature(item: Path) -> str:
+    stat_result = item.stat()
+    if item.is_file():
+        digest = hashlib.sha256(item.read_bytes()).hexdigest()
+        return f"file:{stat_result.st_size}:{digest}"
+
+    child_names = sorted(child.name for child in item.iterdir())
+    return f"dir:{stat_result.st_mtime_ns}:{stat_result.st_ctime_ns}:{'|'.join(child_names)}"
 
 
 def parse_days_list(days_value: str) -> list[int]:
@@ -57,6 +68,28 @@ def parse_days_list(days_value: str) -> list[int]:
         seen.add(day)
         unique_days.append(day)
     return unique_days
+
+
+def parse_sites_list(site_value: str) -> list[str]:
+    sites: list[str] = []
+    for token in site_value.split(","):
+        site = token.strip()
+        if not site:
+            continue
+        sites.append(site)
+
+    if not sites:
+        raise ValueError("--site did not contain any valid station values")
+
+    seen: set[str] = set()
+    unique_sites: list[str] = []
+    for site in sites:
+        site_key = site.lower()
+        if site_key in seen:
+            continue
+        seen.add(site_key)
+        unique_sites.append(site)
+    return unique_sites
 
 
 def _matching_dat_file_names(station_dir: Path, site_prefix: str, day_of_year: int, year: int) -> set[str]:
@@ -490,13 +523,13 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
         raise RuntimeError("absolTEC reported 'Error, no files'. Check DAT_PATH and input files.")
 
 
-def capture_workdir_state(workdir: Path) -> dict[str, int]:
-    state: dict[str, int] = {}
+def capture_workdir_state(workdir: Path) -> dict[str, str]:
+    state: dict[str, str] = {}
     for item in workdir.iterdir():
         if item.name in {"absolTEC.exe", "absolTEC.dia"}:
             continue
         try:
-            state[item.name] = item.stat().st_mtime_ns
+            state[item.name] = _workdir_item_signature(item)
         except FileNotFoundError:
             continue
     return state
@@ -547,7 +580,12 @@ def organize_station_output_by_day(output_dir: Path, year: int, day_of_year: int
     return destination
 
 
-def move_absoltec_results(workdir: Path, output_dir: Path, year: int, before_state: dict[str, int]) -> list[Path]:
+def move_absoltec_results(
+    workdir: Path,
+    output_dir: Path,
+    year: int,
+    before_state: dict[str, str],
+) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     year_dir = workdir / str(year)
@@ -558,12 +596,12 @@ def move_absoltec_results(workdir: Path, output_dir: Path, year: int, before_sta
         for item in workdir.iterdir():
             if item.name in {"absolTEC.exe", "absolTEC.dia"}:
                 continue
-            previous_mtime = before_state.get(item.name)
+            previous_signature = before_state.get(item.name)
             try:
-                current_mtime = item.stat().st_mtime_ns
+                current_signature = _workdir_item_signature(item)
             except FileNotFoundError:
                 continue
-            if previous_mtime is None or current_mtime != previous_mtime:
+            if previous_signature is None or current_signature != previous_signature:
                 candidates.append(item)
 
     moved: list[Path] = []
@@ -786,6 +824,68 @@ def main() -> None:
         )
         return
 
+    if "," in args.site:
+        sites_to_process = parse_sites_list(args.site)
+        total_runs = len(sites_to_process)
+        skipped_runs = 0
+
+        for run_index, site in enumerate(sites_to_process, start=1):
+            logger.info(
+                "Processing year=%s day=%03d site=%s (%s/%s)",
+                args.year,
+                args.day_of_year,
+                site,
+                run_index,
+                total_runs,
+            )
+            try:
+                run_single_station(
+                    workdir=workdir,
+                    dia_path=dia_path,
+                    exe_path=exe_path,
+                    dat_path_obj=dat_path_obj,
+                    output_dir=resolved_output_dir,
+                    year=args.year,
+                    day_of_year=args.day_of_year,
+                    site=site,
+                    elevation_cutoff=args.elevation_cutoff,
+                    time_step_hours=args.time_step_hours,
+                    correction_coefficient=args.correction_coefficient,
+                    dry_run=args.dry_run,
+                    runner=args.runner,
+                    execution_timeout_seconds=args.execution_timeout_seconds,
+                    organize_by_day=True,
+                )
+            except FileNotFoundError as exc:
+                skipped_runs += 1
+                logger.warning(
+                    "Skipping year=%s day=%03d site=%s due to missing input files: %s",
+                    args.year,
+                    args.day_of_year,
+                    site,
+                    exc,
+                )
+            except ValueError as exc:
+                skipped_runs += 1
+                logger.warning(
+                    "Skipping year=%s day=%03d site=%s due to invalid input data: %s",
+                    args.year,
+                    args.day_of_year,
+                    site,
+                    exc,
+                )
+
+            percent = round(run_index * 100 / total_runs)
+            logger.info("Completed %s / %s", run_index, total_runs)
+            logger.info("Progress: %s%%", percent)
+
+        logger.info(
+            "Multi-station run complete. Total station runs: %s, skipped: %s",
+            total_runs,
+            skipped_runs,
+        )
+        return
+
     run_single_station(
         workdir=workdir,
         dia_path=dia_path,
@@ -794,14 +894,14 @@ def main() -> None:
         output_dir=resolved_output_dir,
         year=args.year,
         day_of_year=args.day_of_year,
-        site=args.site,
+        site=args.site.strip(),
         elevation_cutoff=args.elevation_cutoff,
         time_step_hours=args.time_step_hours,
         correction_coefficient=args.correction_coefficient,
         dry_run=args.dry_run,
         runner=args.runner,
         execution_timeout_seconds=args.execution_timeout_seconds,
-        organize_by_day=False,
+        organize_by_day=True,
     )
     logger.info("Completed 1 / 1")
     logger.info("Progress: 100%")
