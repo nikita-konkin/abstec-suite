@@ -22,6 +22,17 @@ PROGRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"Progress:\s*(\d{1,3})\s*%", flags=re.IGNORECASE),
 )
 
+WINE_STARTUP_FAILURE_MARKERS: tuple[str, ...] = (
+    "shellexecuteex failed: not enough memory",
+    'failed to start l"z:',
+    "c0000135",
+)
+
+
+def _looks_like_wine_startup_failure(output_text: str) -> bool:
+    lowered = output_text.lower()
+    return any(marker in lowered for marker in WINE_STARTUP_FAILURE_MARKERS)
+
 
 def _workdir_item_signature(item: Path) -> str:
     stat_result = item.stat()
@@ -328,6 +339,58 @@ def find_wine_binary() -> str | None:
     return None
 
 
+def find_wineserver_binary(wine_path: str | None = None) -> str | None:
+    wineserver_path = shutil.which("wineserver")
+    if wineserver_path:
+        return wineserver_path
+
+    if wine_path:
+        candidate = Path(wine_path).with_name("wineserver")
+        if candidate.exists():
+            return str(candidate)
+
+    known_paths = [
+        Path("/usr/bin/wineserver"),
+        Path("/usr/lib/wine/wineserver"),
+        Path("/usr/lib/wine/wineserver64"),
+        Path("/usr/local/bin/wineserver"),
+        Path("/opt/homebrew/bin/wineserver"),
+    ]
+    for candidate in known_paths:
+        if candidate.exists():
+            return str(candidate)
+
+    return None
+
+
+def reset_wine_runtime(*, wine_path: str | None = None) -> None:
+    """Best-effort cleanup to mitigate long-run Wine resource leaks in containers."""
+    if platform.system() != "Linux":
+        return
+
+    resolved_wine = wine_path or find_wine_binary()
+    wineserver = find_wineserver_binary(resolved_wine)
+    if not wineserver:
+        logger.warning("Wine reset requested but wineserver binary was not found.")
+        return
+
+    try:
+        subprocess.run(
+            [wineserver, "-k"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [wineserver, "-w"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        logger.warning("Wine reset failed: %s", exc)
+
+
 def resolve_runner_command(exe_path: Path, runner: str) -> list[str]:
     if runner == "direct":
         return [str(exe_path)]
@@ -451,59 +514,77 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
     logger.info("Starting absolTEC execution: %s", " ".join(command))
     logger.info("absolTEC working directory: %s", exe_path.parent)
 
-    proc = subprocess.Popen(
-        command,
-        cwd=str(exe_path.parent),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+    use_wine = should_use_wine(exe_path, runner)
+    max_attempts = 2 if use_wine and platform.system() == "Linux" else 1
 
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as exc:
-        _kill_wine_process_group(proc)
+    for attempt in range(1, max_attempts + 1):
+        proc = subprocess.Popen(
+            command,
+            cwd=str(exe_path.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
         try:
-            stdout, stderr = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            stdout, stderr = exc.stdout or "", exc.stderr or ""
-        output_hint = ""
-        combined = f"{stdout}\n{stderr}".strip()
-        if combined:
-            output_hint = f" Last output: {combined[-400:]}"
-        raise RuntimeError(
-            f"absolTEC did not finish within {timeout_seconds} seconds. "
-            f"Command: {' '.join(command)}."
-            f"{output_hint}"
-        ) from exc
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            _kill_wine_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = exc.stdout or "", exc.stderr or ""
+            output_hint = ""
+            combined = f"{stdout}\n{stderr}".strip()
+            if combined:
+                output_hint = f" Last output: {combined[-400:]}"
+            raise RuntimeError(
+                f"absolTEC did not finish within {timeout_seconds} seconds. "
+                f"Command: {' '.join(command)}."
+                f"{output_hint}"
+            ) from exc
 
-    if stdout:
-        logger.info(stdout.rstrip("\n"))
-    if stderr:
-        logger.error(stderr.rstrip("\n"))
+        if stdout:
+            logger.info(stdout.rstrip("\n"))
+        if stderr:
+            logger.error(stderr.rstrip("\n"))
 
-    combined_streams = "\n".join(part for part in (stdout, stderr) if part)
-    progress_counter = extract_progress_counters(combined_streams)
-    if progress_counter:
-        logger.info("Progress counter: %s / %s", progress_counter[0], progress_counter[1])
+        combined_streams = "\n".join(part for part in (stdout, stderr) if part)
+        progress_counter = extract_progress_counters(combined_streams)
+        if progress_counter:
+            logger.info("Progress counter: %s / %s", progress_counter[0], progress_counter[1])
 
-    if proc.returncode != 0:
+        combined_output = f"{stdout}\n{stderr}"
+
+        if proc.returncode == 0:
+            if "error, no files" in combined_output.lower():
+                raise RuntimeError("absolTEC reported 'Error, no files'. Check DAT_PATH and input files.")
+            return
+
+        if (
+            use_wine
+            and attempt < max_attempts
+            and _looks_like_wine_startup_failure(combined_output)
+        ):
+            logger.warning(
+                "Wine failed to start absolTEC.exe (attempt %s/%s). Resetting Wine runtime and retrying once.",
+                attempt,
+                max_attempts,
+            )
+            reset_wine_runtime()
+            continue
+
         base_error = (
             f"absolTEC process failed (return code {proc.returncode}). "
             f"Command: {' '.join(command)}"
         )
-        combined_output = f"{stdout}\n{stderr}".lower()
-        if (
-            "shellexecuteex failed: not enough memory" in combined_output
-            or "failed to start l\"z:" in combined_output
-            or "c0000135" in combined_output
-        ):
+        if use_wine and _looks_like_wine_startup_failure(combined_output):
             base_error += (
                 " Wine failed to start this executable in the current Linux container runtime. "
-                "This is often a Wine compatibility issue for this specific binary (not actual host RAM exhaustion). "
-                "Use --dry-run in container and run absolTEC.exe directly on Windows for production execution."
+                "This is often a Wine compatibility issue or long-run Wine resource leak (not actual host RAM exhaustion). "
+                "If this happens mid-batch, try enabling periodic Wine resets or run absolTEC.exe directly on Windows for production execution."
             )
         if proc.returncode < 0:
             signal_number = -proc.returncode
@@ -518,9 +599,10 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
                 )
         raise RuntimeError(base_error)
 
-    combined_output = f"{stdout}\n{stderr}".lower()
-    if "error, no files" in combined_output:
-        raise RuntimeError("absolTEC reported 'Error, no files'. Check DAT_PATH and input files.")
+    raise RuntimeError(
+        "absolTEC execution failed after retries. "
+        f"Command: {' '.join(command)}"
+    )
 
 
 def capture_workdir_state(workdir: Path) -> dict[str, str]:
@@ -762,12 +844,30 @@ def main() -> None:
         raise FileNotFoundError(f"Data path not found: {dat_path_obj}")
 
     resolved_output_dir = Path(args.output_dir).resolve() if args.output_dir else None
+    use_wine = should_use_wine(exe_path, args.runner)
 
     if args.days:
         station_run_plan = build_station_run_plan(dat_path_obj, args.year, days_to_process)
         total_runs = len(station_run_plan)
         skipped_runs = 0
+        wine_reset_every_runs = 0
+        if use_wine and platform.system() == "Linux" and not args.dry_run:
+            if total_runs >= 500 or len(days_to_process) > 7:
+                wine_reset_every_runs = int(os.environ.get("WINE_RESET_EVERY_RUNS", "200"))
+                wine_reset_every_runs = max(0, wine_reset_every_runs)
+
         for run_index, (day_of_year, site) in enumerate(station_run_plan, start=1):
+            if (
+                wine_reset_every_runs
+                and run_index > 1
+                and (run_index - 1) % wine_reset_every_runs == 0
+            ):
+                logger.info(
+                    "Resetting Wine runtime after %s station runs to avoid long-batch failures.",
+                    run_index - 1,
+                )
+                reset_wine_runtime()
+
             logger.info(
                 "Processing year=%s day=%03d site=%s (%s/%s)",
                 args.year,
@@ -828,8 +928,23 @@ def main() -> None:
         sites_to_process = parse_sites_list(args.site)
         total_runs = len(sites_to_process)
         skipped_runs = 0
+        wine_reset_every_runs = 0
+        if use_wine and platform.system() == "Linux" and total_runs >= 500 and not args.dry_run:
+            wine_reset_every_runs = int(os.environ.get("WINE_RESET_EVERY_RUNS", "200"))
+            wine_reset_every_runs = max(0, wine_reset_every_runs)
 
         for run_index, site in enumerate(sites_to_process, start=1):
+            if (
+                wine_reset_every_runs
+                and run_index > 1
+                and (run_index - 1) % wine_reset_every_runs == 0
+            ):
+                logger.info(
+                    "Resetting Wine runtime after %s station runs to avoid long-batch failures.",
+                    run_index - 1,
+                )
+                reset_wine_runtime()
+
             logger.info(
                 "Processing year=%s day=%03d site=%s (%s/%s)",
                 args.year,
