@@ -340,6 +340,63 @@ class RunAbsoltecTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 run_absoltec(exe_path, "wine", timeout_seconds=5)
 
+    def test_run_absoltec_timeout_with_wine_startup_failure_retries_once(self) -> None:
+        exe_path = Path("/tmp/absolTEC.exe")
+        startup_output = (
+            b"Application could not be started, or no application associated with the specified file.\n"
+            b"ShellExecuteEx failed: "
+        )
+        first_proc = MagicMock()
+        first_proc.pid = 12345
+        first_proc.communicate.side_effect = [
+            TimeoutExpired(cmd=["/usr/bin/wine", str(exe_path)], timeout=5, output=startup_output),
+            ("", ""),
+        ]
+        second_proc = MagicMock()
+        second_proc.pid = 12346
+        second_proc.communicate.return_value = ("ok", "")
+        second_proc.returncode = 0
+
+        with (
+            patch("run_absoltec.platform.system", return_value="Linux"),
+            patch("run_absoltec.resolve_runner_command", return_value=["/usr/bin/wine", str(exe_path)]),
+            patch("run_absoltec.subprocess.Popen", side_effect=[first_proc, second_proc]),
+            patch("run_absoltec._kill_wine_process_group"),
+            patch("run_absoltec.reset_wine_runtime") as mock_reset_wine_runtime,
+        ):
+            run_absoltec(exe_path, "wine", timeout_seconds=5)
+
+        mock_reset_wine_runtime.assert_called_once_with(wine_path="/usr/bin/wine")
+
+    def test_run_absoltec_timeout_with_wine_startup_failure_raises_clear_error(self) -> None:
+        exe_path = Path("/tmp/absolTEC.exe")
+        startup_output = (
+            b"Application could not be started, or no application associated with the specified file.\n"
+            b"ShellExecuteEx failed: "
+        )
+        first_proc = MagicMock()
+        first_proc.pid = 12345
+        first_proc.communicate.side_effect = [
+            TimeoutExpired(cmd=["/usr/bin/wine", str(exe_path)], timeout=5, output=startup_output),
+            ("", ""),
+        ]
+        second_proc = MagicMock()
+        second_proc.pid = 12346
+        second_proc.communicate.side_effect = [
+            TimeoutExpired(cmd=["/usr/bin/wine", str(exe_path)], timeout=5, output=startup_output),
+            ("", ""),
+        ]
+
+        with (
+            patch("run_absoltec.platform.system", return_value="Linux"),
+            patch("run_absoltec.resolve_runner_command", return_value=["/usr/bin/wine", str(exe_path)]),
+            patch("run_absoltec.subprocess.Popen", side_effect=[first_proc, second_proc]),
+            patch("run_absoltec._kill_wine_process_group"),
+            patch("run_absoltec.reset_wine_runtime"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Wine failed to start absolTEC.exe in the current Linux container runtime"):
+                run_absoltec(exe_path, "wine", timeout_seconds=5)
+
     def test_capture_workdir_state_ignores_binary_and_dia(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workdir = Path(temp_dir)

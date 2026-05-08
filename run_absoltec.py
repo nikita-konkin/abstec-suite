@@ -23,6 +23,8 @@ PROGRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 WINE_STARTUP_FAILURE_MARKERS: tuple[str, ...] = (
+    "application could not be started, or no application associated with the specified file.",
+    "shellexecuteex failed:",
     "shellexecuteex failed: not enough memory",
     'failed to start l"z:',
     "c0000135",
@@ -32,6 +34,14 @@ WINE_STARTUP_FAILURE_MARKERS: tuple[str, ...] = (
 def _looks_like_wine_startup_failure(output_text: str) -> bool:
     lowered = output_text.lower()
     return any(marker in lowered for marker in WINE_STARTUP_FAILURE_MARKERS)
+
+
+def _coerce_process_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _workdir_item_signature(item: Path) -> str:
@@ -535,9 +545,28 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
             try:
                 stdout, stderr = proc.communicate(timeout=10)
             except subprocess.TimeoutExpired:
-                stdout, stderr = exc.stdout or "", exc.stderr or ""
-            output_hint = ""
+                stdout, stderr = exc.stdout, exc.stderr
+            stdout = _coerce_process_output(stdout) or _coerce_process_output(exc.stdout)
+            stderr = _coerce_process_output(stderr) or _coerce_process_output(exc.stderr)
             combined = f"{stdout}\n{stderr}".strip()
+            if use_wine and _looks_like_wine_startup_failure(combined):
+                if attempt < max_attempts:
+                    logger.warning(
+                        "Wine failed to start absolTEC.exe and then hung until timeout (attempt %s/%s). Resetting Wine runtime and retrying once.",
+                        attempt,
+                        max_attempts,
+                    )
+                    reset_wine_runtime(wine_path=command[0])
+                    continue
+                output_hint = ""
+                if combined:
+                    output_hint = f" Last output: {combined[-400:]}"
+                raise RuntimeError(
+                    "Wine failed to start absolTEC.exe in the current Linux container runtime. "
+                    f"Command: {' '.join(command)}."
+                    f"{output_hint}"
+                ) from exc
+            output_hint = ""
             if combined:
                 output_hint = f" Last output: {combined[-400:]}"
             raise RuntimeError(
@@ -545,6 +574,8 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
                 f"Command: {' '.join(command)}."
                 f"{output_hint}"
             ) from exc
+        stdout = _coerce_process_output(stdout)
+        stderr = _coerce_process_output(stderr)
 
         if stdout:
             logger.info(stdout.rstrip("\n"))
@@ -573,7 +604,7 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
                 attempt,
                 max_attempts,
             )
-            reset_wine_runtime()
+            reset_wine_runtime(wine_path=command[0])
             continue
 
         base_error = (
