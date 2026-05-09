@@ -7,6 +7,7 @@ from subprocess import CompletedProcess, TimeoutExpired
 from unittest.mock import MagicMock, patch
 
 from run_absoltec import (
+    WineStartupFailureError,
     build_dia_content,
     capture_workdir_state,
     discover_stations_for_day,
@@ -543,6 +544,52 @@ class RunAbsoltecTests(unittest.TestCase):
             all(call.kwargs["organize_by_day"] for call in mock_run_single_station.call_args_list)
         )
 
+    def test_main_multi_day_skips_wine_startup_failure_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "work"
+            dat_path = root / "in"
+            output_dir = root / "out"
+            workdir.mkdir(parents=True)
+            dat_path.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            (workdir / "absolTEC.dia").write_text("x", encoding="utf-8")
+            (workdir / "absolTEC.exe").write_text("x", encoding="utf-8")
+
+            args = Namespace(
+                workdir=str(workdir),
+                dat_path=str(dat_path),
+                year=2026,
+                day_of_year=None,
+                site=None,
+                days="7-8",
+                elevation_cutoff=10.0,
+                time_step_hours=0.5,
+                correction_coefficient=0.97,
+                dry_run=False,
+                runner="wine",
+                execution_timeout_seconds=900,
+                output_dir=str(output_dir),
+            )
+
+            with (
+                patch("run_absoltec.parse_args", return_value=args),
+                patch("run_absoltec.platform.system", return_value="Linux"),
+                patch(
+                    "run_absoltec.build_station_run_plan",
+                    return_value=[(7, "aksu0070"), (7, "alks0070"), (8, "bala0080")],
+                ),
+                patch(
+                    "run_absoltec.run_single_station",
+                    side_effect=[None, WineStartupFailureError("wine failed"), None],
+                ) as mock_run_single_station,
+                patch("run_absoltec.reset_wine_runtime") as mock_reset_wine_runtime,
+            ):
+                main()
+
+        self.assertEqual(mock_run_single_station.call_count, 3)
+        self.assertEqual(mock_reset_wine_runtime.call_count, 1)
+
     def test_main_single_day_with_csv_site_trims_and_deduplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -585,6 +632,48 @@ class RunAbsoltecTests(unittest.TestCase):
         self.assertTrue(
             all(call.kwargs["organize_by_day"] for call in mock_run_single_station.call_args_list)
         )
+
+    def test_main_single_day_csv_skips_wine_startup_failure_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "work"
+            dat_path = root / "in"
+            output_dir = root / "out"
+            workdir.mkdir(parents=True)
+            dat_path.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            (workdir / "absolTEC.dia").write_text("x", encoding="utf-8")
+            (workdir / "absolTEC.exe").write_text("x", encoding="utf-8")
+
+            args = Namespace(
+                workdir=str(workdir),
+                dat_path=str(dat_path),
+                year=2026,
+                day_of_year=7,
+                site="aksu0070,alks0070,bala0070",
+                days=None,
+                elevation_cutoff=10.0,
+                time_step_hours=0.5,
+                correction_coefficient=0.97,
+                dry_run=False,
+                runner="wine",
+                execution_timeout_seconds=900,
+                output_dir=str(output_dir),
+            )
+
+            with (
+                patch("run_absoltec.parse_args", return_value=args),
+                patch("run_absoltec.platform.system", return_value="Linux"),
+                patch(
+                    "run_absoltec.run_single_station",
+                    side_effect=[None, WineStartupFailureError("wine failed"), None],
+                ) as mock_run_single_station,
+                patch("run_absoltec.reset_wine_runtime") as mock_reset_wine_runtime,
+            ):
+                main()
+
+        self.assertEqual(mock_run_single_station.call_count, 3)
+        self.assertEqual(mock_reset_wine_runtime.call_count, 1)
 
     def test_main_single_day_with_single_site_organizes_output_by_day(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

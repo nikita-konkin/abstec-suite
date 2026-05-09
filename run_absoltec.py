@@ -15,6 +15,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+class WineStartupFailureError(RuntimeError):
+    """Raised when Wine fails to launch the Windows executable in the current runtime."""
+
+
 PROGRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Example: "INFO: Completed 2618 / 15221"
     re.compile(r"Completed\s+(\d+)\s*/\s*(\d+)", flags=re.IGNORECASE),
@@ -561,7 +565,7 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
                 output_hint = ""
                 if combined:
                     output_hint = f" Last output: {combined[-400:]}"
-                raise RuntimeError(
+                raise WineStartupFailureError(
                     "Wine failed to start absolTEC.exe in the current Linux container runtime. "
                     f"Command: {' '.join(command)}."
                     f"{output_hint}"
@@ -628,6 +632,8 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
                     " Wine was killed by SIGKILL. Try running Wine manually once to initialize, "
                     "ensure Rosetta is installed on Apple Silicon, and check macOS security prompts/logs."
                 )
+        if use_wine and _looks_like_wine_startup_failure(combined_output):
+            raise WineStartupFailureError(base_error)
         raise RuntimeError(base_error)
 
     raise RuntimeError(
@@ -943,6 +949,17 @@ def main() -> None:
                     site,
                     exc,
                 )
+            except WineStartupFailureError as exc:
+                skipped_runs += 1
+                logger.warning(
+                    "Skipping year=%s day=%03d site=%s due to Wine startup/runtime failure: %s",
+                    args.year,
+                    day_of_year,
+                    site,
+                    exc,
+                )
+                if use_wine and platform.system() == "Linux" and not args.dry_run:
+                    reset_wine_runtime()
 
             percent = round(run_index * 100 / total_runs)
             logger.info("Completed %s / %s", run_index, total_runs)
@@ -1020,6 +1037,17 @@ def main() -> None:
                     site,
                     exc,
                 )
+            except WineStartupFailureError as exc:
+                skipped_runs += 1
+                logger.warning(
+                    "Skipping year=%s day=%03d site=%s due to Wine startup/runtime failure: %s",
+                    args.year,
+                    args.day_of_year,
+                    site,
+                    exc,
+                )
+                if use_wine and platform.system() == "Linux" and not args.dry_run:
+                    reset_wine_runtime()
 
             percent = round(run_index * 100 / total_runs)
             logger.info("Completed %s / %s", run_index, total_runs)
