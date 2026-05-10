@@ -20,6 +20,7 @@ RUN dpkg --add-architecture i386 \
         ca-certificates \
         cabextract \
         fonts-wine \
+        xkb-data \
         xvfb \
         wine \
         wine32:i386 \

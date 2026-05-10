@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import logging
 import os
@@ -9,6 +10,7 @@ import re
 import signal
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -34,6 +36,19 @@ WINE_STARTUP_FAILURE_MARKERS: tuple[str, ...] = (
     "c0000135",
 )
 
+WINE_PROCESS_MARKERS: tuple[str, ...] = (
+    "wine",
+    "wineserver",
+    "winedevice",
+    "winedbg",
+    "wineboot",
+    "rpcss.exe",
+    "services.exe",
+    "plugplay.exe",
+    "explorer.exe",
+    "absoltec.exe",
+)
+
 
 def _looks_like_wine_startup_failure(output_text: str) -> bool:
     lowered = output_text.lower()
@@ -46,6 +61,54 @@ def _coerce_process_output(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _is_retryable_process_spawn_error(exc: OSError) -> bool:
+    return exc.errno in {errno.EAGAIN, errno.ENOMEM}
+
+
+def _list_lingering_wine_pids() -> list[int]:
+    if platform.system() != "Linux":
+        return []
+
+    current_pid = os.getpid()
+    matched_pids: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+
+        pid = int(entry.name)
+        if pid == current_pid:
+            continue
+
+        try:
+            comm_text = (entry / "comm").read_text(encoding="utf-8", errors="replace").strip().lower()
+        except OSError:
+            comm_text = ""
+
+        try:
+            cmdline_text = (
+                (entry / "cmdline").read_bytes().decode("utf-8", errors="replace").replace("\x00", " ").lower()
+            )
+        except OSError:
+            cmdline_text = ""
+
+        haystack = f"{comm_text} {cmdline_text}"
+        if any(marker in haystack for marker in WINE_PROCESS_MARKERS):
+            matched_pids.append(pid)
+
+    return matched_pids
+
+
+def _kill_lingering_wine_processes() -> int:
+    killed = 0
+    for pid in _list_lingering_wine_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            continue
+    return killed
 
 
 def _workdir_item_signature(item: Path) -> str:
@@ -388,21 +451,36 @@ def reset_wine_runtime(*, wine_path: str | None = None) -> None:
         logger.warning("Wine reset requested but wineserver binary was not found.")
         return
 
+    force_killed = 0
     try:
-        subprocess.run(
+        shutdown = subprocess.run(
             [wineserver, "-k"],
             check=False,
             capture_output=True,
             text=True,
         )
-        subprocess.run(
+        wait_result = subprocess.run(
             [wineserver, "-w"],
             check=False,
             capture_output=True,
             text=True,
         )
+        if shutdown.returncode != 0 or wait_result.returncode != 0:
+            logger.warning(
+                "Wine reset returned non-zero status (shutdown=%s, wait=%s). Forcing cleanup of lingering Wine processes.",
+                shutdown.returncode,
+                wait_result.returncode,
+            )
+            force_killed = _kill_lingering_wine_processes()
     except OSError as exc:
         logger.warning("Wine reset failed: %s", exc)
+        force_killed = _kill_lingering_wine_processes()
+
+    if force_killed:
+        logger.warning("Force-killed %s lingering Wine process(es) during reset.", force_killed)
+
+    # Give the kernel a moment to release pid/process-table pressure before the next launch.
+    time.sleep(1.0)
 
 
 def resolve_runner_command(exe_path: Path, runner: str) -> list[str]:
@@ -532,15 +610,32 @@ def run_absoltec(exe_path: Path, runner: str, timeout_seconds: float | None = No
     max_attempts = 2 if use_wine and platform.system() == "Linux" else 1
 
     for attempt in range(1, max_attempts + 1):
-        proc = subprocess.Popen(
-            command,
-            cwd=str(exe_path.parent),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                command,
+                cwd=str(exe_path.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            if use_wine and platform.system() == "Linux" and _is_retryable_process_spawn_error(exc):
+                if attempt < max_attempts:
+                    logger.warning(
+                        "Wine process spawn failed for absolTEC.exe (attempt %s/%s): %s. Resetting Wine runtime and retrying once.",
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                    reset_wine_runtime(wine_path=command[0])
+                    continue
+                raise WineStartupFailureError(
+                    "Wine process spawn failed for absolTEC.exe in the current Linux container runtime. "
+                    f"Command: {' '.join(command)}. Error: {exc}"
+                ) from exc
+            raise
 
         try:
             stdout, stderr = proc.communicate(timeout=timeout_seconds)

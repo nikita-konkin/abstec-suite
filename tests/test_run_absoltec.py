@@ -1,3 +1,4 @@
+import errno
 import subprocess
 import tempfile
 import unittest
@@ -396,6 +397,43 @@ class RunAbsoltecTests(unittest.TestCase):
             patch("run_absoltec.reset_wine_runtime"),
         ):
             with self.assertRaisesRegex(RuntimeError, "Wine failed to start absolTEC.exe in the current Linux container runtime"):
+                run_absoltec(exe_path, "wine", timeout_seconds=5)
+
+    def test_run_absoltec_spawn_resource_error_retries_once(self) -> None:
+        exe_path = Path("/tmp/absolTEC.exe")
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("ok", "")
+        mock_proc.returncode = 0
+
+        with (
+            patch("run_absoltec.platform.system", return_value="Linux"),
+            patch("run_absoltec.resolve_runner_command", return_value=["/usr/bin/wine", str(exe_path)]),
+            patch(
+                "run_absoltec.subprocess.Popen",
+                side_effect=[BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"), mock_proc],
+            ),
+            patch("run_absoltec.reset_wine_runtime") as mock_reset_wine_runtime,
+        ):
+            run_absoltec(exe_path, "wine", timeout_seconds=5)
+
+        mock_reset_wine_runtime.assert_called_once_with(wine_path="/usr/bin/wine")
+
+    def test_run_absoltec_spawn_resource_error_raises_clear_wine_failure(self) -> None:
+        exe_path = Path("/tmp/absolTEC.exe")
+
+        with (
+            patch("run_absoltec.platform.system", return_value="Linux"),
+            patch("run_absoltec.resolve_runner_command", return_value=["/usr/bin/wine", str(exe_path)]),
+            patch(
+                "run_absoltec.subprocess.Popen",
+                side_effect=[
+                    BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),
+                    BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),
+                ],
+            ),
+            patch("run_absoltec.reset_wine_runtime"),
+        ):
+            with self.assertRaisesRegex(WineStartupFailureError, "Wine process spawn failed for absolTEC.exe"):
                 run_absoltec(exe_path, "wine", timeout_seconds=5)
 
     def test_capture_workdir_state_ignores_binary_and_dia(self) -> None:
