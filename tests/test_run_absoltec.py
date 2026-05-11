@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from run_absoltec import (
     WineStartupFailureError,
+    _is_wine_process_name,
     build_dia_content,
     capture_workdir_state,
     discover_stations_for_day,
@@ -140,6 +141,12 @@ class RunAbsoltecTests(unittest.TestCase):
     def test_to_wine_windows_path_converts_posix_path(self) -> None:
         converted = to_wine_windows_path("/tmp")
         self.assertTrue(converted.startswith("Z:\\"))
+
+    def test_is_wine_process_name_matches_known_executable_basename(self) -> None:
+        self.assertTrue(_is_wine_process_name("/usr/bin/wine"))
+        self.assertTrue(_is_wine_process_name("rpcss.exe"))
+        self.assertFalse(_is_wine_process_name("python"))
+        self.assertFalse(_is_wine_process_name("--runner"))
 
     def test_should_use_wine_for_auto_non_windows_exe(self) -> None:
         with patch("run_absoltec.platform.system", return_value="Darwin"):
@@ -434,6 +441,21 @@ class RunAbsoltecTests(unittest.TestCase):
             patch("run_absoltec.reset_wine_runtime"),
         ):
             with self.assertRaisesRegex(WineStartupFailureError, "Wine process spawn failed for absolTEC.exe"):
+                run_absoltec(exe_path, "wine", timeout_seconds=5)
+
+    def test_run_absoltec_wineserver_fork_error_raises_wine_startup_failure(self) -> None:
+        exe_path = Path("/tmp/absolTEC.exe")
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("", "wineserver: fork: Resource temporarily unavailable")
+        mock_proc.returncode = 1
+
+        with (
+            patch("run_absoltec.platform.system", return_value="Linux"),
+            patch("run_absoltec.resolve_runner_command", return_value=["/usr/bin/wine", str(exe_path)]),
+            patch("run_absoltec.subprocess.Popen", return_value=mock_proc),
+            patch("run_absoltec.reset_wine_runtime"),
+        ):
+            with self.assertRaisesRegex(WineStartupFailureError, "Wine failed to start this executable"):
                 run_absoltec(exe_path, "wine", timeout_seconds=5)
 
     def test_capture_workdir_state_ignores_binary_and_dia(self) -> None:

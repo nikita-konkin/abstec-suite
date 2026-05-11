@@ -32,23 +32,50 @@ WINE_STARTUP_FAILURE_MARKERS: tuple[str, ...] = (
     "application could not be started, or no application associated with the specified file.",
     "shellexecuteex failed:",
     "shellexecuteex failed: not enough memory",
+    "fork: resource temporarily unavailable",
     'failed to start l"z:',
     "c0000135",
 )
 
-WINE_PROCESS_MARKERS: tuple[str, ...] = (
-    "wine",
-    "wineserver",
-    "winedevice",
-    "winedbg",
-    "wineboot",
-    "rpcss.exe",
-    "services.exe",
-    "plugplay.exe",
-    "explorer.exe",
-    "absoltec.exe",
+WINE_PROCESS_NAMES: frozenset[str] = frozenset(
+    {
+        "wine",
+        "wine64",
+        "wine-preloader",
+        "wine64-preloader",
+        "wineserver",
+        "winedevice",
+        "winedevice.exe",
+        "winedbg",
+        "wineboot",
+        "rpcss.exe",
+        "services.exe",
+        "plugplay.exe",
+        "explorer.exe",
+        "winemenubuilder.exe",
+        "absoltec.exe",
+    }
 )
 
+
+def _is_wine_process_name(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return False
+    return Path(candidate).name.lower() in WINE_PROCESS_NAMES
+
+
+def _extract_process_argv0(entry: Path) -> str:
+    try:
+        cmdline_bytes = (entry / "cmdline").read_bytes()
+    except OSError:
+        return ""
+
+    for raw_part in cmdline_bytes.split(b"\x00"):
+        if not raw_part:
+            continue
+        return raw_part.decode("utf-8", errors="replace")
+    return ""
 
 def _looks_like_wine_startup_failure(output_text: str) -> bool:
     lowered = output_text.lower()
@@ -86,15 +113,11 @@ def _list_lingering_wine_pids() -> list[int]:
         except OSError:
             comm_text = ""
 
-        try:
-            cmdline_text = (
-                (entry / "cmdline").read_bytes().decode("utf-8", errors="replace").replace("\x00", " ").lower()
-            )
-        except OSError:
-            cmdline_text = ""
+        if _is_wine_process_name(comm_text):
+            matched_pids.append(pid)
+            continue
 
-        haystack = f"{comm_text} {cmdline_text}"
-        if any(marker in haystack for marker in WINE_PROCESS_MARKERS):
+        if _is_wine_process_name(_extract_process_argv0(entry)):
             matched_pids.append(pid)
 
     return matched_pids
