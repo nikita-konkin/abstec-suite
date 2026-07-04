@@ -265,7 +265,7 @@ def normalize_dat_path(dat_path: str) -> str:
 def should_use_wine(exe_path: Path, runner: str) -> bool:
     if runner == "wine":
         return True
-    if runner == "direct":
+    if runner in ("direct", "dockur"):
         return False
     if platform.system() == "Windows":
         return False
@@ -510,6 +510,12 @@ def resolve_runner_command(exe_path: Path, runner: str) -> list[str]:
     if runner == "direct":
         return [str(exe_path)]
 
+    if runner == "dockur":
+        raise ValueError(
+            "The dockur runner does not launch a local process. "
+            "Jobs are dispatched through the shared jobs directory instead."
+        )
+
     if runner == "wine":
         wine_path = find_wine_binary()
         if not wine_path:
@@ -521,7 +527,7 @@ def resolve_runner_command(exe_path: Path, runner: str) -> list[str]:
         return [wine_path, str(exe_path)]
 
     if runner != "auto":
-        raise ValueError("--runner must be one of: auto, direct, wine")
+        raise ValueError("--runner must be one of: auto, direct, wine, dockur")
 
     if platform.system() == "Windows":
         return [str(exe_path)]
@@ -850,6 +856,178 @@ def move_absoltec_results(
     return moved
 
 
+DOCKUR_DEFAULT_GUEST_DAT_PATH = "W:\\in\\"
+DOCKUR_GUEST_WORKDIR = "C:\\absoltec\\work"
+DOCKUR_GUEST_OUT_ROOT = "W:\\out"
+DOCKUR_KILL_GRACE_SECONDS = 30.0
+
+
+def build_dockur_job_bat(year: int) -> str:
+    """Batch script executed inside the Windows XP guest for a single station run.
+
+    XP-era cmd only: no timeout.exe/robocopy, and redirections are written
+    before `echo` so single-digit exit codes are not parsed as fd numbers.
+    """
+    lines = [
+        "@echo off",
+        "setlocal",
+        'set "JOB=%~dp0"',
+        f'set "WORK={DOCKUR_GUEST_WORKDIR}"',
+        f'set "YEAR={year}"',
+        'if not exist "%WORK%\\absolTEC.exe" (',
+        '  >"%JOB%job.log" echo job.bat: absolTEC.exe not found in %WORK%',
+        '  >"%JOB%job.done" echo 3',
+        "  goto :eof",
+        ")",
+        'copy /y "%JOB%absolTEC.dia" "%WORK%\\absolTEC.dia" >nul',
+        'cd /d "%WORK%"',
+        'absolTEC.exe >"%JOB%job.log" 2>&1',
+        'set "CODE=%ERRORLEVEL%"',
+        'if exist "%WORK%\\%YEAR%" (',
+        f'  xcopy "%WORK%\\%YEAR%" "{DOCKUR_GUEST_OUT_ROOT}\\%YEAR%\\" /e /i /y >nul',
+        '  rmdir /s /q "%WORK%\\%YEAR%"',
+        ")",
+        '>"%JOB%job.done" echo %CODE%',
+        "endlocal",
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def submit_dockur_job(jobs_dir: Path, dia_content: str, year: int, label: str) -> Path:
+    """Create a job folder in the shared jobs directory and mark it ready.
+
+    job.ready is written last so the guest watcher never picks up a
+    half-written job over SMB.
+    """
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+    job_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{safe_label}_{os.urandom(4).hex()}"
+    job_dir = jobs_dir / job_name
+    job_dir.mkdir()
+    (job_dir / "absolTEC.dia").write_text(dia_content, encoding="utf-8")
+    (job_dir / "job.bat").write_bytes(build_dockur_job_bat(year).encode("ascii"))
+    (job_dir / "job.ready").write_text("ready\n", encoding="ascii")
+    return job_dir
+
+
+def _read_new_log_text(log_path: Path, offset: int) -> tuple[str, int]:
+    try:
+        with log_path.open("rb") as log_file:
+            log_file.seek(offset)
+            chunk = log_file.read()
+    except OSError:
+        return "", offset
+    if not chunk:
+        return "", offset
+    return chunk.decode("utf-8", errors="replace"), offset + len(chunk)
+
+
+def _read_dockur_exit_code(done_path: Path, poll_seconds: float) -> int:
+    # The guest writes job.done in one small write, but allow a short window
+    # for the content to become visible across the SMB/bind-mount boundary.
+    deadline = time.monotonic() + 10.0
+    while True:
+        raw = ""
+        try:
+            raw = done_path.read_text(encoding="ascii", errors="replace").strip()
+        except OSError:
+            pass
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                raise RuntimeError(
+                    f"Unreadable exit code in {done_path}: {raw!r}. "
+                    "Inspect the job folder inside the shared jobs directory."
+                ) from None
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"job.done appeared but stayed empty: {done_path}")
+        time.sleep(poll_seconds)
+
+
+def wait_for_dockur_job(
+    job_dir: Path,
+    timeout_seconds: float | None,
+    poll_seconds: float | None = None,
+    kill_grace_seconds: float = DOCKUR_KILL_GRACE_SECONDS,
+) -> tuple[int, str]:
+    """Wait for the XP guest to finish a job, streaming job.log into the logger.
+
+    Returns (exit_code, combined_log_text). On timeout a job.kill flag is
+    written so the guest watcher force-terminates absolTEC.exe.
+    """
+    if poll_seconds is None:
+        poll_seconds = float(os.environ.get("DOCKUR_POLL_SECONDS", "2"))
+    log_path = job_dir / "job.log"
+    done_path = job_dir / "job.done"
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
+    log_offset = 0
+    collected: list[str] = []
+
+    def drain_log() -> None:
+        nonlocal log_offset
+        text, log_offset = _read_new_log_text(log_path, log_offset)
+        if text:
+            collected.append(text)
+            for line in text.splitlines():
+                if line.strip():
+                    logger.info("[absolTEC] %s", line.rstrip())
+
+    while not done_path.exists():
+        drain_log()
+        if deadline is not None and time.monotonic() > deadline:
+            (job_dir / "job.kill").write_text("timeout\n", encoding="ascii")
+            kill_deadline = time.monotonic() + kill_grace_seconds
+            while time.monotonic() < kill_deadline and not done_path.exists():
+                time.sleep(poll_seconds)
+            drain_log()
+            raise RuntimeError(
+                f"absolTEC did not finish within {timeout_seconds} seconds in the XP guest "
+                f"(job {job_dir.name}). A kill flag was sent to the guest watcher. "
+                "Job folder kept for inspection."
+            )
+        time.sleep(poll_seconds)
+
+    drain_log()
+    exit_code = _read_dockur_exit_code(done_path, poll_seconds)
+    combined = "".join(collected)
+    progress_counter = extract_progress_counters(combined)
+    if progress_counter:
+        logger.info("Progress counter: %s / %s", progress_counter[0], progress_counter[1])
+    return exit_code, combined
+
+
+def run_absoltec_dockur(
+    *,
+    jobs_dir: Path,
+    dia_content: str,
+    year: int,
+    label: str,
+    timeout_seconds: float | None,
+) -> None:
+    job_dir = submit_dockur_job(jobs_dir, dia_content, year, label)
+    logger.info("Submitted dockur job: %s", job_dir.name)
+    exit_code, output = wait_for_dockur_job(job_dir, timeout_seconds)
+
+    if exit_code == 0 and "error, no files" in output.lower():
+        raise RuntimeError(
+            "absolTEC reported 'Error, no files' in the XP guest. "
+            "Check that the guest dat path (absolTEC.dia line 1) points at the "
+            "shared input folder and that input files exist for this station."
+        )
+    if exit_code != 0:
+        output_hint = ""
+        tail = output.strip()[-400:]
+        if tail:
+            output_hint = f" Last output: {tail}"
+        raise RuntimeError(
+            f"absolTEC exited with code {exit_code} in the XP guest (job {job_dir.name})."
+            f"{output_hint} Job folder kept for inspection."
+        )
+
+    shutil.rmtree(job_dir, ignore_errors=True)
+
+
 def run_single_station(
     *,
     workdir: Path,
@@ -867,15 +1045,18 @@ def run_single_station(
     runner: str,
     execution_timeout_seconds: float,
     organize_by_day: bool,
+    dockur_jobs_dir: Path | None = None,
+    dockur_guest_dat_path: str = DOCKUR_DEFAULT_GUEST_DAT_PATH,
 ) -> None:
     validate_dat_inputs(dat_path_obj, site, day_of_year, year)
 
     dat_path_for_dia = str(dat_path_obj)
-    if should_use_wine(exe_path, runner):
+    if runner == "dockur":
+        dat_path_for_dia = dockur_guest_dat_path
+    elif should_use_wine(exe_path, runner):
         dat_path_for_dia = to_wine_windows_path(str(dat_path_obj))
 
-    update_dia_file(
-        dia_path=dia_path,
+    dia_content = build_dia_content(
         dat_path=dat_path_for_dia,
         elevation_cutoff=elevation_cutoff,
         year=year,
@@ -884,6 +1065,7 @@ def run_single_station(
         time_step_hours=time_step_hours,
         correction_coefficient=correction_coefficient,
     )
+    dia_path.write_text(dia_content, encoding="utf-8")
     logger.info("Updated: %s", dia_path)
 
     if dry_run:
@@ -893,6 +1075,29 @@ def run_single_station(
     timeout_seconds: float | None = execution_timeout_seconds
     if timeout_seconds is not None and timeout_seconds <= 0:
         timeout_seconds = None
+
+    if runner == "dockur":
+        if dockur_jobs_dir is None:
+            raise ValueError("--dockur-jobs-dir is required when --runner dockur is used")
+        run_absoltec_dockur(
+            jobs_dir=dockur_jobs_dir,
+            dia_content=dia_content,
+            year=year,
+            label=f"{year}_{day_of_year:03d}_{site}",
+            timeout_seconds=timeout_seconds,
+        )
+        logger.info("Finished dockur job: year=%s day=%03d site=%s", year, day_of_year, site)
+        # The guest copies workdir\<year> straight into the shared out folder,
+        # so only the host-side rename/organize steps remain.
+        if output_dir:
+            renamed = rename_station_output(output_dir, year, site)
+            if renamed:
+                logger.info("Renamed station output folder to: %s", renamed)
+            if organize_by_day:
+                organized = organize_station_output_by_day(output_dir, year, day_of_year, site)
+                if organized:
+                    logger.info("Organized station output under day folder: %s", organized)
+        return
 
     before_state = capture_workdir_state(workdir) if output_dir else {}
     run_absoltec(exe_path, runner, timeout_seconds=timeout_seconds)
@@ -947,9 +1152,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--runner",
-        choices=["auto", "direct", "wine"],
+        choices=["auto", "direct", "wine", "dockur"],
         default="auto",
-        help="How to launch absolTEC executable (default: auto)",
+        help=(
+            "How to launch absolTEC executable (default: auto). "
+            "'dockur' dispatches jobs to a Windows XP guest running in a "
+            "dockur/windows KVM container via a shared jobs directory."
+        ),
+    )
+    parser.add_argument(
+        "--dockur-jobs-dir",
+        default=os.environ.get("DOCKUR_JOBS_DIR"),
+        help=(
+            "Host path of the jobs directory shared with the XP guest "
+            "(required for --runner dockur; defaults to DOCKUR_JOBS_DIR env)."
+        ),
+    )
+    parser.add_argument(
+        "--dockur-guest-dat-path",
+        default=os.environ.get("DOCKUR_GUEST_DAT_PATH", DOCKUR_DEFAULT_GUEST_DAT_PATH),
+        help=(
+            "Input data root as seen from inside the XP guest, written to "
+            f"absolTEC.dia line 1 (default: {DOCKUR_DEFAULT_GUEST_DAT_PATH!r})."
+        ),
     )
     parser.add_argument(
         "--execution-timeout-seconds",
@@ -1001,6 +1226,19 @@ def main() -> None:
     resolved_output_dir = Path(args.output_dir).resolve() if args.output_dir else None
     use_wine = should_use_wine(exe_path, args.runner)
 
+    dockur_jobs_dir: Path | None = None
+    if args.runner == "dockur":
+        if not args.dockur_jobs_dir:
+            raise ValueError(
+                "--runner dockur requires --dockur-jobs-dir (or the DOCKUR_JOBS_DIR environment variable)"
+            )
+        dockur_jobs_dir = Path(args.dockur_jobs_dir).resolve()
+        if not args.dry_run and not dockur_jobs_dir.exists():
+            raise FileNotFoundError(
+                f"Dockur jobs directory not found: {dockur_jobs_dir}. "
+                "Is the shared jobs volume mounted (see docker-compose.dockur.yml)?"
+            )
+
     if args.days:
         station_run_plan = build_station_run_plan(dat_path_obj, args.year, days_to_process)
         total_runs = len(station_run_plan)
@@ -1048,6 +1286,8 @@ def main() -> None:
                     runner=args.runner,
                     execution_timeout_seconds=args.execution_timeout_seconds,
                     organize_by_day=True,
+                    dockur_jobs_dir=dockur_jobs_dir,
+                    dockur_guest_dat_path=args.dockur_guest_dat_path,
                 )
             except FileNotFoundError as exc:
                 skipped_runs += 1
@@ -1136,6 +1376,8 @@ def main() -> None:
                     runner=args.runner,
                     execution_timeout_seconds=args.execution_timeout_seconds,
                     organize_by_day=True,
+                    dockur_jobs_dir=dockur_jobs_dir,
+                    dockur_guest_dat_path=args.dockur_guest_dat_path,
                 )
             except FileNotFoundError as exc:
                 skipped_runs += 1
@@ -1194,6 +1436,8 @@ def main() -> None:
         runner=args.runner,
         execution_timeout_seconds=args.execution_timeout_seconds,
         organize_by_day=True,
+        dockur_jobs_dir=dockur_jobs_dir,
+        dockur_guest_dat_path=args.dockur_guest_dat_path,
     )
     logger.info("Completed 1 / 1")
     logger.info("Progress: 100%")

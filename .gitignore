@@ -35,6 +35,12 @@ TayAbsTEC_24.04.17/**/*.dat
 TayAbsTEC_24.04.17/**/*.tmp
 TayAbsTEC_24.04.17/**/*.log
 
+# dockur/windows XP guest runtime state (disk image can be many GB)
+dockur/storage/*
+!dockur/storage/.gitkeep
+dockur/jobs/*
+!dockur/jobs/.gitkeep
+
 # data
 in
 

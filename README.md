@@ -18,7 +18,10 @@ This workspace helps automate a Windows-based TayAbsTEC workflow:
 - `run_absoltec.py`: Main CLI runner. Updates `absolTEC.dia`, validates input `.dat` files, and launches `absolTEC.exe`.
 - `generate_absoltec_launchers.py`: Generates per-station `.bat` launchers for a selected date.
 - `run_absoltec.bat`: Example single-run Windows launcher.
+- `docker-compose.dockur.yml`: Windows XP guest (dockur/windows, KVM) + dockur-mode runner — see [README.dockur.md](README.dockur.md).
+- `dockur/oem/`: Provisioning scripts executed inside the XP guest (`install.bat`, `watcher.bat`).
 - `tests/test_run_absoltec.py`: Unit tests for run and validation logic.
+- `tests/test_dockur_runner.py`: Unit tests for the dockur job-dispatch protocol.
 - `tests/test_generate_absoltec_launchers.py`: Unit tests for launcher generation.
 
 Removed component:
@@ -215,7 +218,7 @@ When `DAYS` is set, the container passes `--days` to `run_absoltec.py` and does 
 
 The Compose service is pinned to `linux/amd64` so Apple Silicon Macs run the Wine environment under Docker's x86_64 emulation instead of a native `arm64` container.
 
-`RUNNER` is also configurable (`auto`, `wine`, `direct`). The default in this container is `wine`.
+`RUNNER` is also configurable (`auto`, `wine`, `direct`, `dockur`). The default in this container is `wine`. The `dockur` runner dispatches execution to a real Windows XP guest instead of Wine — see [Windows XP runner](#windows-xp-runner-dockurwindows-kvm).
 
 Dry run is enabled by default in Compose (`DRY_RUN=1`). Disable it with:
 
@@ -270,7 +273,7 @@ Important limitation:
 - If the image build fails with `ResourceExhausted` or `cannot allocate memory`, increase Docker Desktop memory first. In practice, `6 GB` is a safer minimum and `8 GB` is more reliable.
 - The first non-dry run can be slower while Wine initializes.
 - If Wine is not desired, keep `DRY_RUN=1` and run `absolTEC.exe` directly on Windows.
-- Some TayAbsTEC executable builds may still fail under Linux Wine with errors such as `ShellExecuteEx failed: Not enough memory` or `wine: failed to start ...`. In that case, treat container execution as unsupported for non-dry runs on that host and execute `absolTEC.exe` on native Windows.
+- Some TayAbsTEC executable builds may still fail under Linux Wine with errors such as `ShellExecuteEx failed: Not enough memory` or `wine: failed to start ...`. In that case, treat container execution as unsupported for non-dry runs on that host and execute `absolTEC.exe` on native Windows — or use the [Windows XP runner](#windows-xp-runner-dockurwindows-kvm), which runs the exe on real Windows inside a KVM container on the same Linux host.
 
 If you see this exact runtime error:
 
@@ -293,7 +296,72 @@ If that command succeeds but `absolTEC.exe` still fails, use this split workflow
 1. Run container in `DRY_RUN=1` mode to validate inputs and rewrite `absolTEC.dia`.
 2. Execute `absolTEC.exe` on native Windows for production runs.
 
-If you need to execute `absolTEC.exe`, run `run_absoltec.py` directly on Windows (without `--dry-run`).
+If you need to execute `absolTEC.exe`, run `run_absoltec.py` directly on Windows (without `--dry-run`), or use the Windows XP runner below.
+
+## Windows XP Runner (dockur/windows, KVM)
+
+An alternative to Wine for unstable hosts: `absolTEC.exe` executes inside a real
+Windows XP Professional guest running in a [dockur/windows](https://github.com/dockur/windows)
+KVM container. The binary is a 32-bit PE built for OS 5.1, so XP is its native
+platform and the whole class of Wine startup/runtime failures disappears.
+
+Full documentation (architecture, job protocol, troubleshooting): [README.dockur.md](README.dockur.md).
+
+Requirements:
+
+- Linux host with `/dev/kvm` (bare metal, or a VM with nested virtualization).
+- A Windows XP Professional license you are entitled to use (dockur installs
+  with generic trial keys, not an activation license).
+- `ABSTEC_INPUT_DATA_PATH_HOST` / `ABSTEC_OUTPUT_DATA_PATH_HOST` set in `.env`.
+
+First-time bring-up (installs XP unattended, ~10-20 minutes — one time only):
+
+```sh
+docker compose -f docker-compose.dockur.yml up -d abstec-xp
+```
+
+Watch the installation at `http://<host>:8006`. When the guest desktop shows a
+console window titled `abstec-watcher` reporting `watching W:\jobs`, the guest
+is ready. The `dockur/oem/` scripts provision this automatically — no manual
+steps inside the VM.
+
+Run a single station (same env knobs as the Wine service, different compose file):
+
+```sh
+docker compose -f docker-compose.dockur.yml run --rm \
+  -e DRY_RUN=0 -e YEAR=2026 -e DAY_OF_YEAR=1 -e SITE=aksu0010 abstec-dockur
+```
+
+Batch mode works the same way:
+
+```sh
+docker compose -f docker-compose.dockur.yml run --rm \
+  -e DRY_RUN=0 -e YEAR=2026 -e DAYS=001-031 abstec-dockur
+```
+
+Or run the host side directly, without the runner container:
+
+```sh
+python run_absoltec.py --runner dockur \
+  --dat-path /path/to/in --output-dir /path/to/out \
+  --dockur-jobs-dir ./dockur/jobs \
+  --year 2026 --day-of-year 1 --site aksu0010
+```
+
+How it differs from the Wine runner:
+
+- Jobs are dispatched through a shared jobs folder (`dockur/jobs` on the host,
+  `W:\jobs` inside the guest) — the guest watcher picks them up, runs the exe,
+  and streams stdout back to `job.log`. Progress reporting and timeouts work
+  exactly as with Wine; on timeout the guest force-terminates `absolTEC.exe`.
+- The guest copies results into the shared out folder itself, so
+  `--output-dir` (or `OUTPUT_DIR`) must point at the folder mounted to
+  `/shared/out` — with the provided compose file this is already wired up.
+- The XP guest persists in `dockur/storage/` (gitignored); `docker restart
+  abstec-xp` also re-syncs the application folder into the guest after an
+  `absolTEC.exe` update.
+- Failed job folders are kept under `dockur/jobs/` for inspection; RDP is
+  available on port `3390` (user `Docker`) for debugging inside the guest.
 
 ## Validation Rules in `run_absoltec.py`
 

@@ -1,0 +1,62 @@
+# Windows XP guest (dockur/windows, KVM) + dockur-mode runner for absolTEC.
+# Requires /dev/kvm on the Linux host (bare metal or nested virtualization).
+#
+# First boot installs XP unattended (~10-20 min): watch http://<host>:8006
+# The /oem folder provisions the job watcher inside the guest (install.bat).
+#
+#   docker compose -f docker-compose.dockur.yml up -d abstec-xp
+#   docker compose -f docker-compose.dockur.yml run --rm abstec-dockur
+services:
+  abstec-xp:
+    image: dockurr/windows
+    container_name: abstec-xp
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      VERSION: "xp"
+      RAM_SIZE: "2G"
+      CPU_CORES: "2"
+      DISK_SIZE: "16G"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "8006:8006"          # web viewer (installation progress + console)
+      - "3390:3389/tcp"      # RDP into the XP guest
+      - "3390:3389/udp"
+    volumes:
+      - ./dockur/storage:/storage                          # guest disk image
+      - ./dockur/oem:/oem                                  # provisioning: install.bat + watcher.bat
+      - ./TayAbsTEC_24.04.17:/shared/app:ro                # guest syncs this to C:\absoltec\work
+      - ${ABSTEC_INPUT_DATA_PATH_HOST}:/shared/in:ro       # guest W:\in
+      - ${ABSTEC_OUTPUT_DATA_PATH_HOST}:/shared/out:rw     # guest W:\out
+      - ./dockur/jobs:/shared/jobs:rw                      # guest W:\jobs
+
+  # Same image as the wine runner, but dispatches jobs to the XP guest
+  # instead of launching wine locally.
+  abstec-dockur:
+    build: .
+    image: abstec-suite:latest
+    profiles: ["runner"]
+    env_file:
+      - .env
+    depends_on:
+      - abstec-xp
+    environment:
+      YEAR: ${YEAR:-2026}
+      DAYS: ${DAYS:-}
+      DAY_OF_YEAR: ${DAY_OF_YEAR:-1}
+      SITE: ${SITE:-aksu}
+      TIME_STEP_HOURS: ${TIME_STEP_HOURS:-0.5}
+      OUTPUT_DIR: ${OUTPUT_DIR:-/data/out}
+      DRY_RUN: ${DRY_RUN:-1}
+      RUNNER: dockur
+      DOCKUR_JOBS_DIR: /data/jobs
+      EXECUTION_TIMEOUT_SECONDS: ${EXECUTION_TIMEOUT_SECONDS:-900}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${ABSTEC_INPUT_DATA_PATH_HOST}:/data/in:ro
+      - ${ABSTEC_OUTPUT_DATA_PATH_HOST}:/data/out:rw
+      - ./dockur/jobs:/data/jobs:rw

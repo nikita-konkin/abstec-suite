@@ -587,6 +587,8 @@ class RunAbsoltecTests(unittest.TestCase):
                 runner="wine",
                 execution_timeout_seconds=900,
                 output_dir=str(output_dir),
+                dockur_jobs_dir=None,
+                dockur_guest_dat_path="W:\\in\\",
             )
 
             with (
@@ -630,6 +632,8 @@ class RunAbsoltecTests(unittest.TestCase):
                 runner="wine",
                 execution_timeout_seconds=900,
                 output_dir=str(output_dir),
+                dockur_jobs_dir=None,
+                dockur_guest_dat_path="W:\\in\\",
             )
 
             with (
@@ -676,6 +680,8 @@ class RunAbsoltecTests(unittest.TestCase):
                 runner="wine",
                 execution_timeout_seconds=900,
                 output_dir=str(output_dir),
+                dockur_jobs_dir=None,
+                dockur_guest_dat_path="W:\\in\\",
             )
 
             with (
@@ -719,6 +725,8 @@ class RunAbsoltecTests(unittest.TestCase):
                 runner="wine",
                 execution_timeout_seconds=900,
                 output_dir=str(output_dir),
+                dockur_jobs_dir=None,
+                dockur_guest_dat_path="W:\\in\\",
             )
 
             with (
@@ -761,6 +769,8 @@ class RunAbsoltecTests(unittest.TestCase):
                 runner="wine",
                 execution_timeout_seconds=900,
                 output_dir=str(output_dir),
+                dockur_jobs_dir=None,
+                dockur_guest_dat_path="W:\\in\\",
             )
 
             with (
