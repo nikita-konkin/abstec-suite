@@ -922,26 +922,39 @@ def _read_new_log_text(log_path: Path, offset: int) -> tuple[str, int]:
     return chunk.decode("utf-8", errors="replace"), offset + len(chunk)
 
 
-def _read_dockur_exit_code(done_path: Path, poll_seconds: float) -> int:
+def _read_dockur_exit_code(
+    done_path: Path,
+    poll_seconds: float,
+    visibility_timeout_seconds: float = 10.0,
+) -> int:
     # The guest writes job.done in one small write, but allow a short window
     # for the content to become visible across the SMB/bind-mount boundary.
-    deadline = time.monotonic() + 10.0
+    # The file can transiently read as NUL bytes (size allocated, data not yet
+    # flushed by the SMB server) — treat that the same as not-yet-written.
+    deadline = time.monotonic() + visibility_timeout_seconds
+    last_raw = ""
     while True:
         raw = ""
         try:
-            raw = done_path.read_text(encoding="ascii", errors="replace").strip()
+            raw = done_path.read_text(encoding="ascii", errors="replace")
         except OSError:
             pass
-        if raw:
+        last_raw = raw
+        cleaned = raw.replace("\x00", "").strip()
+        if cleaned:
             try:
-                return int(raw)
+                return int(cleaned)
             except ValueError:
-                raise RuntimeError(
-                    f"Unreadable exit code in {done_path}: {raw!r}. "
-                    "Inspect the job folder inside the shared jobs directory."
-                ) from None
-        if time.monotonic() > deadline:
-            raise RuntimeError(f"job.done appeared but stayed empty: {done_path}")
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"Unreadable exit code in {done_path}: {raw!r}. "
+                        "Inspect the job folder inside the shared jobs directory."
+                    ) from None
+        elif time.monotonic() > deadline:
+            raise RuntimeError(
+                f"job.done appeared but stayed empty/unflushed: {done_path} "
+                f"(last read: {last_raw!r})"
+            )
         time.sleep(poll_seconds)
 
 
@@ -997,6 +1010,23 @@ def wait_for_dockur_job(
     return exit_code, combined
 
 
+def _wait_for_watcher_ack(job_dir: Path, grace_seconds: float, poll_seconds: float = 0.5) -> bool:
+    """Wait until the guest watcher acknowledges job completion.
+
+    The watcher deletes job.running after it has seen job.done. Removing the
+    job folder before that leaves the watcher polling a nonexistent path
+    forever, stalling the whole queue — so the folder may only be cleaned up
+    once job.running is gone.
+    """
+    running_path = job_dir / "job.running"
+    deadline = time.monotonic() + grace_seconds
+    while running_path.exists():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(poll_seconds)
+    return True
+
+
 def run_absoltec_dockur(
     *,
     jobs_dir: Path,
@@ -1004,6 +1034,7 @@ def run_absoltec_dockur(
     year: int,
     label: str,
     timeout_seconds: float | None,
+    ack_grace_seconds: float = 15.0,
 ) -> None:
     job_dir = submit_dockur_job(jobs_dir, dia_content, year, label)
     logger.info("Submitted dockur job: %s", job_dir.name)
@@ -1025,7 +1056,15 @@ def run_absoltec_dockur(
             f"{output_hint} Job folder kept for inspection."
         )
 
-    shutil.rmtree(job_dir, ignore_errors=True)
+    if _wait_for_watcher_ack(job_dir, ack_grace_seconds):
+        shutil.rmtree(job_dir, ignore_errors=True)
+    else:
+        logger.warning(
+            "Guest watcher did not acknowledge job %s within %.0fs; "
+            "leaving the job folder in place.",
+            job_dir.name,
+            ack_grace_seconds,
+        )
 
 
 def run_single_station(
@@ -1093,6 +1132,14 @@ def run_single_station(
             renamed = rename_station_output(output_dir, year, site)
             if renamed:
                 logger.info("Renamed station output folder to: %s", renamed)
+            else:
+                logger.warning(
+                    "No raw station output found under %s after a successful guest run. "
+                    "Check that the XP VM's /shared/out mount points at the same host "
+                    "folder as --output-dir; otherwise results land elsewhere and "
+                    "same-prefix stations overwrite each other.",
+                    Path(output_dir) / str(year),
+                )
             if organize_by_day:
                 organized = organize_station_output_by_day(output_dir, year, day_of_year, site)
                 if organized:

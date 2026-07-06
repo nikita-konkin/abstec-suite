@@ -29,10 +29,76 @@ run_absoltec.py --runner dockur          Windows XP guest (abstec-xp)
 
 ## Requirements
 
-- Linux host with `/dev/kvm` (bare metal or nested virtualization enabled).
+- A host that can expose `/dev/kvm` to containers: native Linux (bare metal
+  or with nested virtualization), or Windows via Docker Desktop + WSL2 —
+  see "Host setup (KVM)" below for both.
 - A Windows XP Professional license you are entitled to use.
 - `ABSTEC_INPUT_DATA_PATH_HOST` / `ABSTEC_OUTPUT_DATA_PATH_HOST` set in `.env`
   (same variables the wine compose file uses).
+
+## Host setup (KVM)
+
+dockur/windows runs QEMU with hardware acceleration and refuses to start
+without `/dev/kvm` inside the container (`abstec-xp` exits almost
+immediately, typically with status 255). How `/dev/kvm` appears differs
+per host OS.
+
+### Ubuntu / native Linux
+
+1. Enable VT-x (Intel) / AMD-V (SVM) in the BIOS/UEFI if not already on.
+2. Install Docker Engine + the compose plugin
+   (<https://docs.docker.com/engine/install/ubuntu/>).
+3. Verify KVM:
+
+   ```sh
+   sudo apt install -y cpu-checker
+   kvm-ok            # expect: "KVM acceleration can be used"
+   ls -l /dev/kvm
+   ```
+
+   On bare metal the `kvm_intel` / `kvm_amd` module loads automatically at
+   boot. If `/dev/kvm` exists but the container gets "permission denied",
+   add your user to the `kvm` group (`sudo usermod -aG kvm $USER`,
+   re-login) or run compose with sudo.
+4. If Ubuntu itself is a VM, enable nested virtualization in the outer
+   hypervisor first — without it `/dev/kvm` never appears.
+5. Set the `.env` host paths in Linux form (e.g.
+   `ABSTEC_INPUT_DATA_PATH_HOST=/srv/rinex/out`) and continue with
+   "First-time bring-up".
+
+### Windows (Docker Desktop + WSL2)
+
+Works, but KVM inside the docker-desktop WSL2 distro is **not** enabled out
+of the box:
+
+1. Docker Desktop must use the WSL2 backend (Settings → General), with
+   virtualization enabled in the BIOS. Nested virtualization for WSL2 is on
+   by default on Windows 11; if it was disabled, set
+   `nestedVirtualization=true` under `[wsl2]` in `%USERPROFILE%\.wslconfig`.
+2. The WSL2 kernel ships KVM as a module but never loads it. Load it once
+   (PowerShell, pick the module matching your CPU):
+
+   ```powershell
+   wsl -d docker-desktop -u root modprobe kvm_amd     # AMD
+   wsl -d docker-desktop -u root modprobe kvm_intel   # Intel
+   wsl -d docker-desktop ls -l /dev/kvm               # must exist now
+   ```
+
+3. This does **not** survive `wsl --shutdown`, a Docker Desktop restart, or
+   a reboot: `/dev/kvm` disappears, `abstec-xp` shows `Exited (255)` and
+   cannot be started until the module is reloaded. To make it permanent,
+   add a boot command to `/etc/wsl.conf` inside the docker-desktop distro
+   (use `kvm_intel` on Intel), then restart Docker Desktop once:
+
+   ```powershell
+   wsl -d docker-desktop -u root sh -c 'printf "[boot]\ncommand = \"modprobe kvm_amd\"\n" >> /etc/wsl.conf'
+   ```
+
+4. Host paths in `.env` use Windows form (e.g.
+   `ABSTEC_INPUT_DATA_PATH_HOST=N:\RINEX\out`); Docker Desktop translates
+   the bind mounts. Watch for typos here — the guest happily writes into
+   whatever folder is mounted as `/shared/out`, so a misspelled path means
+   results silently land elsewhere.
 
 ## First-time bring-up
 
@@ -75,6 +141,44 @@ python run_absoltec.py --runner dockur \
 `--output-dir` must point at the host folder that is mounted to
 `/shared/out` (the guest copies results there itself); the host then only
 renames/organizes station folders.
+
+### Compose path overrides
+
+All host paths are overridable via env (defaults in parentheses):
+
+```sh
+ABSTEC_INPUT_DATA_PATH_HOST=...          # DAT input, guest W:\in (required)
+ABSTEC_OUTPUT_DATA_PATH_HOST=...         # results, guest W:\out (required)
+ABSTEC_DOCKUR_JOBS_PATH_HOST=...         # job queue, guest W:\jobs (./dockur/jobs)
+ABSTEC_DOCKUR_STORAGE_PATH_HOST=...      # XP disk image, ~16G (./dockur/storage)
+```
+
+### From the ict-hub GUI
+
+The AbsTEC Suite page in ict-hub has a **Runner** dropdown with a
+`dockur (Windows XP VM)` option. To enable it, set in ict-hub's `.env`:
+
+```sh
+# host path of this repo's dockur/jobs folder (shared with the XP VM)
+ABSTEC_DOCKUR_JOBS_PATH_HOST=/path/to/abstec-suite/dockur/jobs
+# optional, defaults to W:\in\
+# ABSTEC_DOCKUR_GUEST_DAT_PATH=W:\in\
+```
+
+and make sure `TECSUITE_OUT_DAT_DATA_PATH_HOST` / `ABSTEC_OUTPUT_DATA_PATH_HOST`
+in ict-hub point at the same host folders the XP VM mounts as `/shared/in` and
+`/shared/out`. The hub then mounts the jobs folder into the launched
+abstec-suite container and passes `--runner dockur --dockur-jobs-dir /data/jobs`
+automatically.
+
+When a dockur job is submitted, the hub also checks the `abstec-xp` container
+(name configurable via `ABSTEC_DOCKUR_VM_CONTAINER`) and starts it if it is
+stopped — e.g. after a Docker Desktop restart. Note that a restart also drops
+`/dev/kvm` unless `kvm_amd`/`kvm_intel` loading is persisted (see "Host setup
+(KVM)" above), in which case the VM cannot start and the job fails with the
+Docker error message. The container
+must already exist (created once via the compose command above); the hub never
+creates it.
 
 ## Notes and troubleshooting
 

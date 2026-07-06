@@ -52,6 +52,12 @@ echo [%date% %time%] starting job %JOB%
 >"%JOB%\job.running" echo running
 start "abstec-job" /min cmd /c "%JOB%\job.bat"
 :wait_job
+rem If the host removed the whole job folder (cleanup race), stop waiting
+rem instead of polling a nonexistent path forever.
+if not exist "%JOB%\" (
+  echo [%date% %time%] job folder gone, resuming watch: %JOB%
+  goto :eof
+)
 if exist "%JOB%\job.done" goto job_done
 if exist "%JOB%\job.kill" (
   echo [%date% %time%] kill requested for %JOB%

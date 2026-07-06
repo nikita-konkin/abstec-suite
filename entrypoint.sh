@@ -3,6 +3,19 @@ set -e
 
 RUNNER="${RUNNER:-wine}"
 
+# When CLI args are passed (e.g. by ict-hub), honour --runner from the args so
+# a dockur run skips the wine/Xvfb bootstrap below.
+prev=""
+for arg in "$@"; do
+	if [ "$prev" = "--runner" ]; then
+		RUNNER="$arg"
+	fi
+	case "$arg" in
+		--runner=*) RUNNER="${arg#--runner=}" ;;
+	esac
+	prev="$arg"
+done
+
 # Wine and the virtual display are only needed for local wine execution;
 # the dockur runner dispatches jobs to the Windows XP guest instead.
 if [ "$RUNNER" != "dockur" ]; then

@@ -27,12 +27,13 @@ services:
       - "3390:3389/tcp"      # RDP into the XP guest
       - "3390:3389/udp"
     volumes:
-      - ./dockur/storage:/storage                          # guest disk image
+      - ${ABSTEC_DOCKUR_STORAGE_PATH_HOST:-./dockur/storage}:/storage   # guest disk image (needs ~16G free)
       - ./dockur/oem:/oem                                  # provisioning: install.bat + watcher.bat
       - ./TayAbsTEC_24.04.17:/shared/app:ro                # guest syncs this to C:\absoltec\work
       - ${ABSTEC_INPUT_DATA_PATH_HOST}:/shared/in:ro       # guest W:\in
       - ${ABSTEC_OUTPUT_DATA_PATH_HOST}:/shared/out:rw     # guest W:\out
-      - ./dockur/jobs:/shared/jobs:rw                      # guest W:\jobs
+      # Must match ict-hub's ABSTEC_DOCKUR_JOBS_PATH_HOST when jobs come from the GUI.
+      - ${ABSTEC_DOCKUR_JOBS_PATH_HOST:-./dockur/jobs}:/shared/jobs:rw   # guest W:\jobs
 
   # Same image as the wine runner, but dispatches jobs to the XP guest
   # instead of launching wine locally.
@@ -59,4 +60,4 @@ services:
     volumes:
       - ${ABSTEC_INPUT_DATA_PATH_HOST}:/data/in:ro
       - ${ABSTEC_OUTPUT_DATA_PATH_HOST}:/data/out:rw
-      - ./dockur/jobs:/data/jobs:rw
+      - ${ABSTEC_DOCKUR_JOBS_PATH_HOST:-./dockur/jobs}:/data/jobs:rw
