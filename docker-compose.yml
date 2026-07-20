@@ -2,7 +2,7 @@ services:
   abstec:
     platform: linux/amd64
     build: .
-    image: abstec-suite:latest
+    image: nikitaikonkin/abstec-suite:latest
     shm_size: "1gb"
     env_file:
       - .env
