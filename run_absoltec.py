@@ -1586,7 +1586,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Number of stations to process concurrently (default: 1). Only the "
             "'dockur' runner supports values above 1, and the XP guest watcher must "
-            "expose at least this many slots (see ABSTEC_WATCHER_SLOTS)."
+            "expose at least this many slots (set the number in <jobs dir>/_slots.cfg "
+            "and restart the guest)."
         ),
     )
     parser.add_argument(
@@ -1698,8 +1699,8 @@ def main() -> None:
             elif slots < jobs:
                 logger.warning(
                     "The XP guest watcher exposes %s slot(s) but --jobs is %s; the extra "
-                    "jobs will simply queue. Raise ABSTEC_WATCHER_SLOTS (and the guest's "
-                    "CPU_CORES) to run more at once.",
+                    "jobs will simply queue. Raise the number in <jobs dir>/_slots.cfg "
+                    "(and the guest's CPU_CORES), then restart the guest.",
                     slots,
                     jobs,
                 )
