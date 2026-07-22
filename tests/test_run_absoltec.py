@@ -594,6 +594,9 @@ class RunAbsoltecTests(unittest.TestCase):
                 min_data_rows=0,
                 strict_dat_validation=False,
                 max_consecutive_failures=25,
+                manifest=None,
+                no_manifest=True,
+                job_retention_hours=0,
             )
 
             with (
@@ -644,6 +647,9 @@ class RunAbsoltecTests(unittest.TestCase):
                 min_data_rows=0,
                 strict_dat_validation=False,
                 max_consecutive_failures=25,
+                manifest=None,
+                no_manifest=True,
+                job_retention_hours=0,
             )
 
             with (
@@ -697,6 +703,9 @@ class RunAbsoltecTests(unittest.TestCase):
                 min_data_rows=0,
                 strict_dat_validation=False,
                 max_consecutive_failures=25,
+                manifest=None,
+                no_manifest=True,
+                job_retention_hours=0,
             )
 
             with (
@@ -747,6 +756,9 @@ class RunAbsoltecTests(unittest.TestCase):
                 min_data_rows=0,
                 strict_dat_validation=False,
                 max_consecutive_failures=25,
+                manifest=None,
+                no_manifest=True,
+                job_retention_hours=0,
             )
 
             with (
@@ -796,6 +808,9 @@ class RunAbsoltecTests(unittest.TestCase):
                 min_data_rows=0,
                 strict_dat_validation=False,
                 max_consecutive_failures=25,
+                manifest=None,
+                no_manifest=True,
+                job_retention_hours=0,
             )
 
             with (

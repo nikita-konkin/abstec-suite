@@ -62,6 +62,46 @@ the host reads it at startup and warns if `--jobs` exceeds the slot count, or if
 the guest is still running the older serial watcher. Jobs beyond the slot count
 are not lost — they simply queue.
 
+## Run manifest and resuming
+
+Every station's outcome is appended to `<output-dir>/_manifest.csv` (override
+with `--manifest`, disable with `--no-manifest`):
+
+```
+finished_at,year,day_of_year,site,status,reason,duration_seconds
+2026-07-22T12:41:55,2025,008,ktiv,ok,,12.4
+2026-07-22T12:42:08,2025,008,kudi,failed-runtime,RuntimeError: absolTEC exited with code 64...,3.1
+```
+
+A resumed run reads it and skips stations recorded as `ok` or `skipped-existing`.
+Failures and bad-input skips are **not** treated as final, so re-exported data
+gets another chance. This is stricter than `--skip-existing`, which infers state
+from output folders and therefore cannot tell "produced no output" apart from
+"never attempted" — those stations are retried on every resume forever.
+
+`analyze_manifest.py` summarises a finished run:
+
+```bash
+python analyze_manifest.py /data/out/_manifest.csv                    # status + failure breakdown
+python analyze_manifest.py /data/out/_manifest.csv --dat-path /data/in  # test strict validation
+```
+
+The second form is worth running once. `--strict-dat-validation` rejects stations
+whose `.dat` rows cannot be parsed in Python, on the theory that those are what
+make absolTEC abort with `severe (64): input conversion error`. That theory has
+never been checked against real failures. The script compares the stations strict
+validation would reject against the ones that actually crashed and prints recall,
+precision, and a verdict — enough to either enable the flag by default or drop
+the idea and look elsewhere.
+
+## Housekeeping
+
+Failed job folders are kept for inspection and staged output is removed only
+after a successful hand-off, so both accumulate when runs die. They are not free:
+every guest slot re-enumerates the jobs directory over SMB on each poll, so a
+large pile slows the whole queue. Before a dockur batch starts, folders older
+than `--job-retention-hours` (default 48, `0` disables) are pruned.
+
 > **Updating the watcher on an existing guest.** `install.bat` only runs once,
 > right after XP is installed, so editing `dockur/oem/watcher.bat` does not reach
 > a guest that is already provisioned. The installed autostart entry is now a

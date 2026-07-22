@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import errno
 import hashlib
 import logging
@@ -1374,6 +1375,154 @@ def run_single_station(
     return "ok"
 
 
+MANIFEST_FIELDS = (
+    "finished_at",
+    "year",
+    "day_of_year",
+    "site",
+    "status",
+    "reason",
+    "duration_seconds",
+)
+
+# Statuses that mean "this station has been dealt with"; a resumed run skips
+# them. Failures and bad-input skips are deliberately absent so that re-exported
+# data gets another chance.
+MANIFEST_TERMINAL_STATUSES = frozenset({"ok", "skipped-existing"})
+
+
+class RunManifest:
+    """Append-only per-station record of what a batch actually did.
+
+    Output folders alone cannot answer "was this station already processed?" —
+    a station that legitimately produces no output looks identical to one that
+    was never attempted, so --skip-existing retries it on every resume. The
+    manifest records the outcome explicitly.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._previous: dict[tuple[int, int, str], str] = {}
+
+    @staticmethod
+    def key(year: int, day_of_year: int, site: str) -> tuple[int, int, str]:
+        return (int(year), int(day_of_year), site.strip().lower())
+
+    def load(self) -> int:
+        """Read an existing manifest so a resumed run can skip finished work."""
+        if not self.path.exists():
+            return 0
+        loaded = 0
+        with self.path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    entry = self.key(int(row["year"]), int(row["day_of_year"]), row["site"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                status = (row.get("status") or "").strip()
+                # Later rows win: a station retried after a failure ends up
+                # with its most recent outcome.
+                self._previous[entry] = status
+                loaded += 1
+        return loaded
+
+    def already_done(self, year: int, day_of_year: int, site: str) -> str | None:
+        status = self._previous.get(self.key(year, day_of_year, site))
+        if status in MANIFEST_TERMINAL_STATUSES:
+            return status
+        return None
+
+    def record(
+        self,
+        *,
+        year: int,
+        day_of_year: int,
+        site: str,
+        status: str,
+        reason: str = "",
+        duration_seconds: float | None = None,
+    ) -> None:
+        row = {
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "year": year,
+            "day_of_year": f"{day_of_year:03d}",
+            "site": site,
+            "status": status,
+            # Newlines would break the one-row-per-station shape.
+            "reason": " ".join(str(reason).split())[:300],
+            "duration_seconds": "" if duration_seconds is None else f"{duration_seconds:.1f}",
+        }
+        with self._lock:
+            try:
+                is_new = not self.path.exists() or self.path.stat().st_size == 0
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
+                    if is_new:
+                        writer.writeheader()
+                    writer.writerow(row)
+            except OSError as exc:
+                # Bookkeeping must never take the batch down.
+                logger.warning("Could not write manifest row for %s: %s", site, exc)
+
+
+def prune_dockur_artifacts(
+    jobs_dir: Path | None,
+    output_dir: Path | None,
+    retention_hours: float,
+) -> tuple[int, int]:
+    """Delete stale job folders and staged output left by earlier runs.
+
+    Failed jobs are kept for inspection and staged output is removed only after
+    a successful hand-off, so both leak when a run dies. They also cost real
+    time: every guest slot re-enumerates the jobs directory over SMB on each
+    poll, so the pile slows the whole queue down.
+
+    Returns (removed_jobs, removed_stage_dirs).
+    """
+    if retention_hours <= 0:
+        return 0, 0
+
+    cutoff = time.time() - retention_hours * 3600
+    removed_jobs = 0
+    removed_stage = 0
+
+    def _prune(root: Path, skip_names: frozenset[str]) -> int:
+        removed = 0
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            return 0
+        for entry in entries:
+            if not entry.is_dir() or entry.name in skip_names:
+                continue
+            try:
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        return removed
+
+    if jobs_dir is not None and jobs_dir.is_dir():
+        removed_jobs = _prune(jobs_dir, frozenset())
+    if output_dir is not None:
+        stage_root = output_dir / DOCKUR_STAGE_DIR_NAME
+        if stage_root.is_dir():
+            removed_stage = _prune(stage_root, frozenset())
+
+    if removed_jobs or removed_stage:
+        logger.info(
+            "Pruned %s stale job folder(s) and %s staged output folder(s) older than %.0fh.",
+            removed_jobs,
+            removed_stage,
+            retention_hours,
+        )
+    return removed_jobs, removed_stage
+
+
 def execute_station_runs(
     tasks: list[tuple[int, str]],
     run_station: Callable[[int, str], str],
@@ -1383,6 +1532,7 @@ def execute_station_runs(
     max_consecutive_failures: int,
     wine_reset_every_runs: int = 0,
     reset_wine: Callable[[], None] | None = None,
+    manifest: "RunManifest | None" = None,
 ) -> tuple[int, int]:
     """Run every (day_of_year, site) task, skipping failures instead of aborting.
 
@@ -1410,8 +1560,18 @@ def execute_station_runs(
         error: BaseException | None,
         reason: str = "",
         status: str = "ok",
+        duration: float | None = None,
     ) -> None:
         nonlocal completed, skipped, consecutive_failures
+        if manifest is not None:
+            manifest.record(
+                year=year,
+                day_of_year=day_of_year,
+                site=site,
+                status=status,
+                reason=f"{type(error).__name__}: {error}" if error is not None else reason,
+                duration_seconds=duration,
+            )
         with state_lock:
             completed += 1
             if error is None:
@@ -1441,6 +1601,20 @@ def execute_station_runs(
     def execute(index: int, day_of_year: int, site: str) -> None:
         if abort_reason:
             return
+
+        if manifest is not None:
+            done = manifest.already_done(year, day_of_year, site)
+            if done:
+                logger.info(
+                    "Skipping year=%s day=%03d site=%s: manifest records '%s'.",
+                    year,
+                    day_of_year,
+                    site,
+                    done,
+                )
+                record(day_of_year, site, None, status="skipped-existing")
+                return
+
         logger.info(
             "Processing year=%s day=%03d site=%s (%s/%s)",
             year,
@@ -1449,23 +1623,29 @@ def execute_station_runs(
             index,
             total_runs,
         )
+        started = time.monotonic()
         try:
             status = run_station(day_of_year, site)
         except FileNotFoundError as exc:
-            record(day_of_year, site, exc, "missing input files")
+            record(day_of_year, site, exc, "missing input files",
+                   status="skipped-missing-input", duration=time.monotonic() - started)
         except ValueError as exc:
-            record(day_of_year, site, exc, "invalid input data")
+            record(day_of_year, site, exc, "invalid input data",
+                   status="skipped-invalid-data", duration=time.monotonic() - started)
         except WineStartupFailureError as exc:
             # Must precede RuntimeError: WineStartupFailureError subclasses it.
-            record(day_of_year, site, exc, "Wine startup/runtime failure")
+            record(day_of_year, site, exc, "Wine startup/runtime failure",
+                   status="failed-wine", duration=time.monotonic() - started)
             if reset_wine is not None:
                 reset_wine()
         except RuntimeError as exc:
             # absolTEC crashed or timed out for this station — e.g. the Fortran
             # "severe (64): input conversion error" raised by a malformed row.
-            record(day_of_year, site, exc, "absolTEC runtime failure")
+            record(day_of_year, site, exc, "absolTEC runtime failure",
+                   status="failed-runtime", duration=time.monotonic() - started)
         else:
-            record(day_of_year, site, None, status=status or "ok")
+            record(day_of_year, site, None, status=status or "ok",
+                   duration=time.monotonic() - started)
 
     if jobs <= 1:
         for index, (day_of_year, site) in enumerate(tasks, start=1):
@@ -1617,6 +1797,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--manifest",
+        default=os.environ.get("ABSTEC_MANIFEST"),
+        help=(
+            "CSV file recording the outcome of every station (status, reason, "
+            "duration). Defaults to <output-dir>/_manifest.csv when --output-dir is "
+            "set. A resumed run reads it and skips stations already completed, which "
+            "--skip-existing cannot do for stations that legitimately produce no output."
+        ),
+    )
+    parser.add_argument(
+        "--no-manifest",
+        action="store_true",
+        help="Disable manifest writing entirely.",
+    )
+    parser.add_argument(
+        "--job-retention-hours",
+        type=float,
+        default=float(os.environ.get("ABSTEC_JOB_RETENTION_HOURS", "48")),
+        help=(
+            "Before a dockur batch starts, delete job folders and staged output left "
+            "by earlier runs that are older than this (default: 48; 0 disables). "
+            "Failed jobs are kept for inspection, so without pruning they accumulate "
+            "and every guest slot re-scans them on each poll."
+        ),
+    )
+    parser.add_argument(
         "--max-consecutive-failures",
         type=int,
         default=int(os.environ.get("ABSTEC_MAX_CONSECUTIVE_FAILURES", "25")),
@@ -1705,6 +1911,26 @@ def main() -> None:
                     jobs,
                 )
 
+    manifest: RunManifest | None = None
+    if not args.no_manifest:
+        manifest_path = args.manifest
+        if not manifest_path and resolved_output_dir is not None:
+            manifest_path = resolved_output_dir / "_manifest.csv"
+        if manifest_path:
+            manifest = RunManifest(Path(manifest_path))
+            previous_rows = manifest.load()
+            if previous_rows:
+                logger.info(
+                    "Loaded %s previous run record(s) from %s; completed stations will be skipped.",
+                    previous_rows,
+                    manifest.path,
+                )
+            else:
+                logger.info("Recording per-station outcomes to %s", manifest.path)
+
+    if args.runner == "dockur" and not args.dry_run:
+        prune_dockur_artifacts(dockur_jobs_dir, resolved_output_dir, args.job_retention_hours)
+
     def run_station(day_of_year: int, site: str) -> str:
         return run_single_station(
             workdir=workdir,
@@ -1747,6 +1973,7 @@ def main() -> None:
             max_consecutive_failures=args.max_consecutive_failures,
             wine_reset_every_runs=wine_reset_every_runs,
             reset_wine=reset_wine_runtime if should_reset_wine else None,
+            manifest=manifest,
         )
         logger.info(
             "Batch run complete. Total station runs: %s, skipped: %s",
@@ -1772,6 +1999,7 @@ def main() -> None:
             max_consecutive_failures=args.max_consecutive_failures,
             wine_reset_every_runs=wine_reset_every_runs,
             reset_wine=reset_wine_runtime if should_reset_wine else None,
+            manifest=manifest,
         )
         logger.info(
             "Multi-station run complete. Total station runs: %s, skipped: %s",
