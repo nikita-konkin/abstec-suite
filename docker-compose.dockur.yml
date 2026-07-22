@@ -14,9 +14,12 @@ services:
     stop_grace_period: 2m
     environment:
       VERSION: "xp"
-      RAM_SIZE: "2G"
-      CPU_CORES: "2"
-      DISK_SIZE: "16G"
+      # Raise these together with the watcher slot count (jobs/_slots.cfg) when
+      # running absolTEC jobs in parallel — one core per concurrent job is a
+      # reasonable starting point.
+      RAM_SIZE: ${ABSTEC_XP_RAM_SIZE:-2G}
+      CPU_CORES: ${ABSTEC_XP_CPU_CORES:-2}
+      DISK_SIZE: ${ABSTEC_XP_DISK_SIZE:-16G}
     devices:
       - /dev/kvm
       - /dev/net/tun
@@ -56,6 +59,11 @@ services:
       RUNNER: dockur
       DOCKUR_JOBS_DIR: /data/jobs
       EXECUTION_TIMEOUT_SECONDS: ${EXECUTION_TIMEOUT_SECONDS:-900}
+      # Stations processed concurrently. Must be <= the guest watcher's slot
+      # count (jobs/_slots.cfg), otherwise the extra jobs just queue.
+      ABSTEC_JOBS: ${ABSTEC_JOBS:-1}
+      ABSTEC_MAX_CONSECUTIVE_FAILURES: ${ABSTEC_MAX_CONSECUTIVE_FAILURES:-25}
+      ABSTEC_MIN_DATA_ROWS: ${ABSTEC_MIN_DATA_ROWS:-0}
       PYTHONUNBUFFERED: "1"
     volumes:
       - ${ABSTEC_INPUT_DATA_PATH_HOST}:/data/in:ro

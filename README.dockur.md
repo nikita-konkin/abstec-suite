@@ -13,19 +13,63 @@ run_absoltec.py --runner dockur          Windows XP guest (abstec-xp)
         |  writes job folder                     |  watcher.bat polls W:\jobs
         v                                        v
   <jobs dir>/<job-id>/            \\host.lan\Data\jobs\<job-id>\
-      absolTEC.dia     ---------->   copied to C:\absoltec\work
+      absolTEC.dia     ---------->   copied to C:\absoltec\work\sN
       job.bat          ---------->   executed, stdout -> job.log
-      job.ready                      results xcopy'd to W:\out\<year>
+      job.ready                      results xcopy'd to W:\out\_stage\<job-id>
                        <----------   exit code written to job.done
 ```
 
 - The host runner tails `job.log` live (same progress parsing as the wine
   runner) and reads the exit code from `job.done`.
 - On timeout the host writes `job.kill`; the guest watcher then
-  `taskkill`s absolTEC.exe and reports exit code 124.
+  `taskkill`s that slot's absolTEC copy and reports exit code 124.
 - Successful job folders are deleted; failed ones are kept for inspection.
 - Guest side is plain XP-era batch (no SSH/WinRM needed): `dockur/oem/install.bat`
   provisions `watcher.bat` as an autostart entry and enables RDP.
+- Results are staged per job under `<out>/_stage/<job-id>/` and only then moved
+  to `<out>/<year>/<doy>/<site>/`. absolTEC always names its result folder after
+  the 4-character site prefix, so without per-job staging two stations sharing a
+  prefix (`kudi0080` / `kudi0081`) overwrite each other.
+
+## Running jobs in parallel
+
+One station at a time leaves the guest mostly idle — much of each job is SMB
+polling, not computation. The watcher can run several jobs concurrently, one per
+*slot*. Each slot has its own workdir (`C:\absoltec\work\sN`) and its own copy of
+the executable (`absolTEC_sN.exe`), because concurrent runs must not share
+`absolTEC.dia`, the result folder, or a `taskkill`.
+
+1. Set the slot count in the shared jobs folder on the host:
+
+   ```bash
+   echo 4 > "$ABSTEC_DOCKUR_JOBS_PATH_HOST/_slots.cfg"
+   ```
+
+2. Give the guest enough CPU (roughly one core per concurrent job) in `.env`:
+
+   ```bash
+   ABSTEC_XP_CPU_CORES=4
+   ABSTEC_XP_RAM_SIZE=4G
+   ```
+
+3. Restart the guest so the watcher re-reads both:
+   `docker compose -f docker-compose.dockur.yml restart abstec-xp`
+
+4. Run with `--jobs 4` (or set "Parallel Jobs" in the ict-hub GUI).
+
+The watcher publishes what it actually supports in `<jobs dir>/_watcher.status`;
+the host reads it at startup and warns if `--jobs` exceeds the slot count, or if
+the guest is still running the older serial watcher. Jobs beyond the slot count
+are not lost — they simply queue.
+
+> **Updating the watcher on an existing guest.** `install.bat` only runs once,
+> right after XP is installed, so editing `dockur/oem/watcher.bat` does not reach
+> a guest that is already provisioned. The installed autostart entry is now a
+> bootstrap that copies `<jobs dir>/watcher.bat` over the local copy at every
+> logon, so to update an existing guest: copy `dockur/oem/watcher.bat` into the
+> shared jobs folder and restart the guest. A guest provisioned before this
+> change needs the bootstrap installed once by hand (RDP in on port 3390 and
+> re-run `C:\OEM\install.bat`), or just recreate the guest.
 
 ## Requirements
 

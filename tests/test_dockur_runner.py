@@ -17,26 +17,26 @@ from run_absoltec import (
 
 class DockurJobBatTests(unittest.TestCase):
     def test_job_bat_uses_crlf_line_endings(self) -> None:
-        content = build_dockur_job_bat(2026)
+        content = build_dockur_job_bat(2026, "20260101_000000_2026_001_aksu_deadbeef")
 
         self.assertTrue(content.endswith("\r\n"))
         self.assertNotIn("\n", content.replace("\r\n", ""))
 
     def test_job_bat_embeds_year(self) -> None:
-        content = build_dockur_job_bat(2026)
+        content = build_dockur_job_bat(2026, "20260101_000000_2026_001_aksu_deadbeef")
 
         self.assertIn('set "YEAR=2026"', content)
 
     def test_job_bat_writes_exit_code_with_leading_redirection(self) -> None:
         # `echo %CODE%> file` would parse a single-digit code as a file
         # descriptor redirect on XP cmd, so the redirection must come first.
-        content = build_dockur_job_bat(2026)
+        content = build_dockur_job_bat(2026, "20260101_000000_2026_001_aksu_deadbeef")
 
         self.assertIn('>"%JOB%job.done" echo %CODE%', content)
         self.assertNotIn('echo %CODE%>', content)
 
     def test_job_bat_is_ascii_only(self) -> None:
-        build_dockur_job_bat(2026).encode("ascii")
+        build_dockur_job_bat(2026, "20260101_000000_2026_001_aksu_deadbeef").encode("ascii")
 
 
 class SubmitDockurJobTests(unittest.TestCase):

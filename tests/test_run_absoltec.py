@@ -589,6 +589,11 @@ class RunAbsoltecTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 dockur_jobs_dir=None,
                 dockur_guest_dat_path="W:\\in\\",
+                jobs=1,
+                skip_existing=False,
+                min_data_rows=0,
+                strict_dat_validation=False,
+                max_consecutive_failures=25,
             )
 
             with (
@@ -634,6 +639,11 @@ class RunAbsoltecTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 dockur_jobs_dir=None,
                 dockur_guest_dat_path="W:\\in\\",
+                jobs=1,
+                skip_existing=False,
+                min_data_rows=0,
+                strict_dat_validation=False,
+                max_consecutive_failures=25,
             )
 
             with (
@@ -682,6 +692,11 @@ class RunAbsoltecTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 dockur_jobs_dir=None,
                 dockur_guest_dat_path="W:\\in\\",
+                jobs=1,
+                skip_existing=False,
+                min_data_rows=0,
+                strict_dat_validation=False,
+                max_consecutive_failures=25,
             )
 
             with (
@@ -727,6 +742,11 @@ class RunAbsoltecTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 dockur_jobs_dir=None,
                 dockur_guest_dat_path="W:\\in\\",
+                jobs=1,
+                skip_existing=False,
+                min_data_rows=0,
+                strict_dat_validation=False,
+                max_consecutive_failures=25,
             )
 
             with (
@@ -771,6 +791,11 @@ class RunAbsoltecTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 dockur_jobs_dir=None,
                 dockur_guest_dat_path="W:\\in\\",
+                jobs=1,
+                skip_existing=False,
+                min_data_rows=0,
+                strict_dat_validation=False,
+                max_consecutive_failures=25,
             )
 
             with (

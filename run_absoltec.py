@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import errno
 import hashlib
 import logging
@@ -10,7 +11,9 @@ import re
 import signal
 import shutil
 import subprocess
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -361,7 +364,69 @@ def resolve_station_data_folder(dat_root: Path, site: str, day_of_year: int, yea
     return exact_path
 
 
-def validate_dat_inputs(dat_path: Path, site: str, day_of_year: int, year: int) -> Path:
+DAT_DATA_COLUMNS = 7
+DAT_BIAS_COLUMN = 5
+
+
+def _is_dat_header_line(stripped_line: str) -> bool:
+    """True for tec-suite header lines that are not data.
+
+    Most are '#'-prefixed, but the column-title line
+    ("tsn, hour, el, az, tec.l1l2, tec.p1p2, validity") is not — it starts
+    with a space, which is exactly the kind of text a fixed-format Fortran
+    READ cannot convert.
+    """
+    if stripped_line.startswith("#"):
+        return True
+    lowered = stripped_line.lower()
+    return lowered.startswith("tsn") and "hour" in lowered
+
+
+def scan_dat_file(dat_file: Path) -> tuple[int, int, list[str]]:
+    """Return (data_rows, nonzero_bias_rows, problems) for one tec-suite .dat file."""
+    data_rows = 0
+    nonzero_bias_rows = 0
+    problems: list[str] = []
+
+    text = dat_file.read_text(encoding="utf-8", errors="ignore")
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        stripped_line = raw_line.strip()
+        if not stripped_line or _is_dat_header_line(stripped_line):
+            continue
+
+        parts = stripped_line.split()
+        if len(parts) != DAT_DATA_COLUMNS:
+            if len(problems) < 5:
+                problems.append(
+                    f"{dat_file.name}:{line_number}: expected {DAT_DATA_COLUMNS} columns, "
+                    f"got {len(parts)}: {stripped_line[:60]!r}"
+                )
+            continue
+
+        try:
+            values = [float(part) for part in parts]
+        except ValueError:
+            if len(problems) < 5:
+                problems.append(
+                    f"{dat_file.name}:{line_number}: non-numeric field: {stripped_line[:60]!r}"
+                )
+            continue
+
+        data_rows += 1
+        if abs(values[DAT_BIAS_COLUMN]) > 1e-9:
+            nonzero_bias_rows += 1
+
+    return data_rows, nonzero_bias_rows, problems
+
+
+def validate_dat_inputs(
+    dat_path: Path,
+    site: str,
+    day_of_year: int,
+    year: int,
+    min_data_rows: int = 0,
+    strict: bool = False,
+) -> Path:
     station_folder = resolve_station_data_folder(dat_path, site, day_of_year, year)
     if not station_folder.exists():
         raise FileNotFoundError(
@@ -381,28 +446,14 @@ def validate_dat_inputs(dat_path: Path, site: str, day_of_year: int, year: int) 
             f"{''.join(site[:4])}_{day_of_year:03d}_{year % 100:02d}.dat"
         )
 
-    nonzero_bias_values = 0
     checked_rows = 0
+    nonzero_bias_values = 0
+    problems: list[str] = []
     for dat_file in matching_files:
-        for raw_line in dat_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-            stripped_line = raw_line.strip()
-            if not stripped_line or stripped_line.startswith("#"):
-                continue
-
-            parts = stripped_line.split()
-            if len(parts) < 7:
-                continue
-
-            checked_rows += 1
-            try:
-                if abs(float(parts[5])) > 1e-9:
-                    nonzero_bias_values += 1
-                    break
-            except ValueError:
-                continue
-
-        if nonzero_bias_values > 0:
-            break
+        rows, nonzero, file_problems = scan_dat_file(dat_file)
+        checked_rows += rows
+        nonzero_bias_values += nonzero
+        problems.extend(file_problems[: max(0, 5 - len(problems))])
 
     if checked_rows == 0:
         raise ValueError(
@@ -414,6 +465,29 @@ def validate_dat_inputs(dat_path: Path, site: str, day_of_year: int, year: int) 
         raise ValueError(
             "All matched .dat files have 0.000 in TEC bias column (6th data column). "
             "TayAbsTEC cannot proceed. Re-export tec-suite data with a valid tec.p1p2/tec.c1p2 column."
+        )
+
+    if problems:
+        # absolTEC parses these files with a fixed Fortran format, so a stray
+        # non-numeric line makes it abort with "severe (64): input conversion
+        # error" rather than skipping the row.
+        detail = "; ".join(problems)
+        if strict:
+            raise ValueError(f"Malformed rows in tec-suite output: {detail}")
+        logger.warning(
+            "Malformed rows in tec-suite output for year=%s day=%03d site=%s "
+            "(absolTEC may abort with a Fortran conversion error): %s",
+            year,
+            day_of_year,
+            site,
+            detail,
+        )
+
+    if min_data_rows and checked_rows < min_data_rows:
+        raise ValueError(
+            f"Only {checked_rows} usable data rows across {len(matching_files)} .dat file(s), "
+            f"below --min-data-rows={min_data_rows}. The station has too little data "
+            "for a meaningful absolTEC run."
         )
 
     return station_folder
@@ -808,6 +882,21 @@ def rename_station_output(output_dir: Path, year: int, site: str) -> Path | None
     return None
 
 
+def station_output_exists(
+    output_dir: Path, year: int, day_of_year: int, site: str, organize_by_day: bool
+) -> bool:
+    """True when a previous run already produced results for this station/day.
+
+    Used by --skip-existing so an interrupted batch can be restarted without
+    redoing the stations it already completed.
+    """
+    if organize_by_day:
+        destination = output_dir / str(year) / f"{day_of_year:03d}" / site
+    else:
+        destination = output_dir / str(year) / site
+    return destination.is_dir() and any(destination.iterdir())
+
+
 def organize_station_output_by_day(output_dir: Path, year: int, day_of_year: int, site: str) -> Path | None:
     year_dir = output_dir / str(year)
     site_dir = year_dir / site
@@ -861,36 +950,75 @@ DOCKUR_GUEST_WORKDIR = "C:\\absoltec\\work"
 DOCKUR_GUEST_OUT_ROOT = "W:\\out"
 DOCKUR_KILL_GRACE_SECONDS = 30.0
 
+# Per-job staging folder under the shared output root. absolTEC always names
+# its result folder after the 4-character site prefix, so every run used to
+# land on the same <out>/<year>/<prefix> path: stations sharing a prefix
+# overwrote each other, and with several jobs in flight a finishing job could
+# pick up another station's folder. Staging each job separately removes both.
+DOCKUR_STAGE_DIR_NAME = "_stage"
+DOCKUR_GUEST_STAGE_ROOT = f"{DOCKUR_GUEST_OUT_ROOT}\\{DOCKUR_STAGE_DIR_NAME}"
 
-def build_dockur_job_bat(year: int) -> str:
+# Written by the guest watcher so the host can tell how many jobs it will run
+# concurrently (absent on pre-parallel watchers).
+DOCKUR_WATCHER_STATUS_NAME = "_watcher.status"
+
+
+def build_dockur_job_bat(year: int, job_name: str) -> str:
     """Batch script executed inside the Windows XP guest for a single station run.
 
     XP-era cmd only: no timeout.exe/robocopy, and redirections are written
     before `echo` so single-digit exit codes are not parsed as fd numbers.
+
+    The watcher passes its slot workdir and per-slot executable name as %1/%2
+    so concurrent jobs never share absolTEC.dia or the result folder. A
+    pre-parallel watcher passes no arguments, so both fall back to the single
+    shared workdir and this script keeps working unchanged.
     """
     lines = [
         "@echo off",
         "setlocal",
         'set "JOB=%~dp0"',
-        f'set "WORK={DOCKUR_GUEST_WORKDIR}"',
+        'set "WORK=%~1"',
+        'set "EXE=%~2"',
+        f'if "%WORK%"=="" set "WORK={DOCKUR_GUEST_WORKDIR}"',
+        'if "%EXE%"=="" set "EXE=absolTEC.exe"',
         f'set "YEAR={year}"',
-        'if not exist "%WORK%\\absolTEC.exe" (',
-        '  >"%JOB%job.log" echo job.bat: absolTEC.exe not found in %WORK%',
+        f'set "STAGE={DOCKUR_GUEST_STAGE_ROOT}\\{job_name}"',
+        'if not exist "%WORK%\\%EXE%" (',
+        '  >"%JOB%job.log" echo job.bat: %EXE% not found in %WORK%',
         '  >"%JOB%job.done" echo 3',
         "  goto :eof",
         ")",
         'copy /y "%JOB%absolTEC.dia" "%WORK%\\absolTEC.dia" >nul',
+        # A previous job in this slot may have died before its results were
+        # collected; shipping them out now would label them with this station.
+        'if exist "%WORK%\\%YEAR%" rmdir /s /q "%WORK%\\%YEAR%"',
         'cd /d "%WORK%"',
-        'absolTEC.exe >"%JOB%job.log" 2>&1',
+        '"%EXE%" >"%JOB%job.log" 2>&1',
         'set "CODE=%ERRORLEVEL%"',
         'if exist "%WORK%\\%YEAR%" (',
-        f'  xcopy "%WORK%\\%YEAR%" "{DOCKUR_GUEST_OUT_ROOT}\\%YEAR%\\" /e /i /y >nul',
+        '  xcopy "%WORK%\\%YEAR%" "%STAGE%\\%YEAR%\\" /e /i /y >nul',
         '  rmdir /s /q "%WORK%\\%YEAR%"',
         ")",
         '>"%JOB%job.done" echo %CODE%',
         "endlocal",
     ]
     return "\r\n".join(lines) + "\r\n"
+
+
+def read_dockur_watcher_slots(jobs_dir: Path) -> int | None:
+    """Return the concurrency the guest watcher advertises, or None if unknown."""
+    try:
+        raw = (jobs_dir / DOCKUR_WATCHER_STATUS_NAME).read_text(
+            encoding="ascii", errors="replace"
+        )
+    except OSError:
+        return None
+    match = re.search(r"slots\s*=\s*(\d+)", raw)
+    if not match:
+        return None
+    slots = int(match.group(1))
+    return slots if slots > 0 else None
 
 
 def submit_dockur_job(jobs_dir: Path, dia_content: str, year: int, label: str) -> Path:
@@ -905,7 +1033,7 @@ def submit_dockur_job(jobs_dir: Path, dia_content: str, year: int, label: str) -
     job_dir = jobs_dir / job_name
     job_dir.mkdir()
     (job_dir / "absolTEC.dia").write_text(dia_content, encoding="utf-8")
-    (job_dir / "job.bat").write_bytes(build_dockur_job_bat(year).encode("ascii"))
+    (job_dir / "job.bat").write_bytes(build_dockur_job_bat(year, job_name).encode("ascii"))
     (job_dir / "job.ready").write_text("ready\n", encoding="ascii")
     return job_dir
 
@@ -1027,6 +1155,46 @@ def _wait_for_watcher_ack(job_dir: Path, grace_seconds: float, poll_seconds: flo
     return True
 
 
+def collect_dockur_stage_output(
+    output_dir: Path,
+    job_name: str,
+    year: int,
+    day_of_year: int,
+    site: str,
+    organize_by_day: bool,
+) -> Path | None:
+    """Move one job's staged guest output into the final output layout.
+
+    The guest writes results to <output_dir>/_stage/<job>/<year>/<prefix>, so
+    the folder belonging to this run is identified by job name rather than by
+    globbing the shared year directory. That is what makes concurrent jobs —
+    and stations sharing a 4-character prefix — safe.
+    """
+    job_stage_dir = output_dir / DOCKUR_STAGE_DIR_NAME / job_name
+    stage_year_dir = job_stage_dir / str(year)
+    if not stage_year_dir.is_dir():
+        return None
+
+    produced = sorted(path for path in stage_year_dir.iterdir() if path.is_dir())
+    if not produced:
+        shutil.rmtree(job_stage_dir, ignore_errors=True)
+        return None
+
+    if organize_by_day:
+        destination = output_dir / str(year) / f"{day_of_year:03d}" / site
+    else:
+        destination = output_dir / str(year) / site
+
+    for index, source in enumerate(produced):
+        # absolTEC emits exactly one folder per run; keep any extras rather
+        # than silently dropping them.
+        target = destination if index == 0 else destination.parent / f"{site}_{source.name}"
+        _move_with_merge(source, target)
+
+    shutil.rmtree(job_stage_dir, ignore_errors=True)
+    return destination
+
+
 def run_absoltec_dockur(
     *,
     jobs_dir: Path,
@@ -1035,7 +1203,7 @@ def run_absoltec_dockur(
     label: str,
     timeout_seconds: float | None,
     ack_grace_seconds: float = 15.0,
-) -> None:
+) -> str:
     job_dir = submit_dockur_job(jobs_dir, dia_content, year, label)
     logger.info("Submitted dockur job: %s", job_dir.name)
     exit_code, output = wait_for_dockur_job(job_dir, timeout_seconds)
@@ -1065,6 +1233,7 @@ def run_absoltec_dockur(
             job_dir.name,
             ack_grace_seconds,
         )
+    return job_dir.name
 
 
 def run_single_station(
@@ -1086,8 +1255,29 @@ def run_single_station(
     organize_by_day: bool,
     dockur_jobs_dir: Path | None = None,
     dockur_guest_dat_path: str = DOCKUR_DEFAULT_GUEST_DAT_PATH,
-) -> None:
-    validate_dat_inputs(dat_path_obj, site, day_of_year, year)
+    min_data_rows: int = 0,
+    strict_dat_validation: bool = False,
+    skip_existing: bool = False,
+) -> str:
+    if skip_existing and output_dir and station_output_exists(
+        output_dir, year, day_of_year, site, organize_by_day
+    ):
+        logger.info(
+            "Skipping year=%s day=%03d site=%s: output already present.",
+            year,
+            day_of_year,
+            site,
+        )
+        return "skipped-existing"
+
+    validate_dat_inputs(
+        dat_path_obj,
+        site,
+        day_of_year,
+        year,
+        min_data_rows=min_data_rows,
+        strict=strict_dat_validation,
+    )
 
     dat_path_for_dia = str(dat_path_obj)
     if runner == "dockur":
@@ -1104,12 +1294,24 @@ def run_single_station(
         time_step_hours=time_step_hours,
         correction_coefficient=correction_coefficient,
     )
-    dia_path.write_text(dia_content, encoding="utf-8")
-    logger.info("Updated: %s", dia_path)
+    if runner == "dockur":
+        # Every dockur job carries its own absolTEC.dia inside the job folder,
+        # so the shared workdir copy is unused — and writing it here would race
+        # between concurrent jobs.
+        logger.info(
+            "Prepared absolTEC.dia for year=%s day=%03d site=%s: %s",
+            year,
+            day_of_year,
+            site,
+            dia_content.replace("\n", " | ").strip(" |"),
+        )
+    else:
+        dia_path.write_text(dia_content, encoding="utf-8")
+        logger.info("Updated: %s", dia_path)
 
     if dry_run:
         logger.info("Dry run enabled. Skipping absolTEC.exe execution.")
-        return
+        return "dry-run"
 
     timeout_seconds: float | None = execution_timeout_seconds
     if timeout_seconds is not None and timeout_seconds <= 0:
@@ -1118,7 +1320,7 @@ def run_single_station(
     if runner == "dockur":
         if dockur_jobs_dir is None:
             raise ValueError("--dockur-jobs-dir is required when --runner dockur is used")
-        run_absoltec_dockur(
+        job_name = run_absoltec_dockur(
             jobs_dir=dockur_jobs_dir,
             dia_content=dia_content,
             year=year,
@@ -1126,25 +1328,27 @@ def run_single_station(
             timeout_seconds=timeout_seconds,
         )
         logger.info("Finished dockur job: year=%s day=%03d site=%s", year, day_of_year, site)
-        # The guest copies workdir\<year> straight into the shared out folder,
-        # so only the host-side rename/organize steps remain.
+        # The guest stages workdir\<year> under <out>\_stage\<job>, so this run's
+        # results are picked up by job name instead of by scanning the shared
+        # year folder that every other job also writes into.
         if output_dir:
-            renamed = rename_station_output(output_dir, year, site)
-            if renamed:
-                logger.info("Renamed station output folder to: %s", renamed)
+            organized = collect_dockur_stage_output(
+                output_dir, job_name, year, day_of_year, site, organize_by_day
+            )
+            if organized:
+                logger.info("Organized station output under day folder: %s", organized)
             else:
                 logger.warning(
-                    "No raw station output found under %s after a successful guest run. "
-                    "Check that the XP VM's /shared/out mount points at the same host "
-                    "folder as --output-dir; otherwise results land elsewhere and "
-                    "same-prefix stations overwrite each other.",
-                    Path(output_dir) / str(year),
+                    "absolTEC produced no output for year=%s day=%03d site=%s "
+                    "(nothing staged under %s). The guest run itself succeeded, so "
+                    "either the station's DAT input yielded no usable arcs, or the "
+                    "XP VM's /shared/out mount does not point at --output-dir.",
+                    year,
+                    day_of_year,
+                    site,
+                    Path(output_dir) / DOCKUR_STAGE_DIR_NAME / job_name,
                 )
-            if organize_by_day:
-                organized = organize_station_output_by_day(output_dir, year, day_of_year, site)
-                if organized:
-                    logger.info("Organized station output under day folder: %s", organized)
-        return
+        return "ok"
 
     before_state = capture_workdir_state(workdir) if output_dir else {}
     run_absoltec(exe_path, runner, timeout_seconds=timeout_seconds)
@@ -1166,6 +1370,148 @@ def run_single_station(
             organized = organize_station_output_by_day(output_dir, year, day_of_year, site)
             if organized:
                 logger.info("Organized station output under day folder: %s", organized)
+
+    return "ok"
+
+
+def execute_station_runs(
+    tasks: list[tuple[int, str]],
+    run_station: Callable[[int, str], str],
+    *,
+    year: int,
+    jobs: int,
+    max_consecutive_failures: int,
+    wine_reset_every_runs: int = 0,
+    reset_wine: Callable[[], None] | None = None,
+) -> tuple[int, int]:
+    """Run every (day_of_year, site) task, skipping failures instead of aborting.
+
+    A station that makes absolTEC exit non-zero used to kill the whole batch:
+    the runner raises a plain RuntimeError, which the old loop did not catch
+    (it handled only FileNotFoundError/ValueError/WineStartupFailureError). One
+    malformed .dat therefore ended an 11k-station run at 15%.
+
+    Failures are still not ignored: `max_consecutive_failures` in a row aborts
+    the batch, because that pattern means something systemic is broken rather
+    than one station having bad data.
+
+    Returns (total_runs, skipped_runs).
+    """
+    total_runs = len(tasks)
+    state_lock = threading.Lock()
+    completed = 0
+    skipped = 0
+    consecutive_failures = 0
+    abort_reason: list[str] = []
+
+    def record(
+        day_of_year: int,
+        site: str,
+        error: BaseException | None,
+        reason: str = "",
+        status: str = "ok",
+    ) -> None:
+        nonlocal completed, skipped, consecutive_failures
+        with state_lock:
+            completed += 1
+            if error is None:
+                consecutive_failures = 0
+                if status == "skipped-existing":
+                    skipped += 1
+            else:
+                skipped += 1
+                consecutive_failures += 1
+                logger.warning(
+                    "Skipping year=%s day=%03d site=%s due to %s: %s",
+                    year,
+                    day_of_year,
+                    site,
+                    reason,
+                    error,
+                )
+                if (
+                    max_consecutive_failures
+                    and consecutive_failures >= max_consecutive_failures
+                    and not abort_reason
+                ):
+                    abort_reason.append(f"{consecutive_failures} consecutive station failures")
+            logger.info("Completed %s / %s", completed, total_runs)
+            logger.info("Progress: %s%%", round(completed * 100 / total_runs))
+
+    def execute(index: int, day_of_year: int, site: str) -> None:
+        if abort_reason:
+            return
+        logger.info(
+            "Processing year=%s day=%03d site=%s (%s/%s)",
+            year,
+            day_of_year,
+            site,
+            index,
+            total_runs,
+        )
+        try:
+            status = run_station(day_of_year, site)
+        except FileNotFoundError as exc:
+            record(day_of_year, site, exc, "missing input files")
+        except ValueError as exc:
+            record(day_of_year, site, exc, "invalid input data")
+        except WineStartupFailureError as exc:
+            # Must precede RuntimeError: WineStartupFailureError subclasses it.
+            record(day_of_year, site, exc, "Wine startup/runtime failure")
+            if reset_wine is not None:
+                reset_wine()
+        except RuntimeError as exc:
+            # absolTEC crashed or timed out for this station — e.g. the Fortran
+            # "severe (64): input conversion error" raised by a malformed row.
+            record(day_of_year, site, exc, "absolTEC runtime failure")
+        else:
+            record(day_of_year, site, None, status=status or "ok")
+
+    if jobs <= 1:
+        for index, (day_of_year, site) in enumerate(tasks, start=1):
+            if (
+                wine_reset_every_runs
+                and index > 1
+                and (index - 1) % wine_reset_every_runs == 0
+                and reset_wine is not None
+            ):
+                logger.info(
+                    "Resetting Wine runtime after %s station runs to avoid long-batch failures.",
+                    index - 1,
+                )
+                reset_wine()
+            execute(index, day_of_year, site)
+            if abort_reason:
+                break
+    else:
+        logger.info("Running up to %s station jobs concurrently.", jobs)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=jobs, thread_name_prefix="station"
+        ) as pool:
+            futures = [
+                pool.submit(execute, index, day_of_year, site)
+                for index, (day_of_year, site) in enumerate(tasks, start=1)
+            ]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    # execute() handles its own errors; this re-raises only if
+                    # the runner itself has a bug worth surfacing loudly.
+                    future.result()
+                    if abort_reason:
+                        break
+            finally:
+                if abort_reason:
+                    for future in futures:
+                        future.cancel()
+
+    if abort_reason:
+        raise RuntimeError(
+            f"Aborting batch after {abort_reason[0]}. That points at something systemic "
+            "(guest watcher stopped, shared mounts, or absolTEC.dia paths) rather than "
+            f"per-station bad data. Completed {completed} of {total_runs} runs."
+        )
+
+    return total_runs, skipped
 
 
 def parse_args() -> argparse.Namespace:
@@ -1233,6 +1579,51 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         help="Optional directory where generated absolTEC results are moved after execution.",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=int(os.environ.get("ABSTEC_JOBS", "1")),
+        help=(
+            "Number of stations to process concurrently (default: 1). Only the "
+            "'dockur' runner supports values above 1, and the XP guest watcher must "
+            "expose at least this many slots (see ABSTEC_WATCHER_SLOTS)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help=(
+            "Skip stations whose output folder already exists and is non-empty, so an "
+            "interrupted batch can be restarted without redoing completed stations."
+        ),
+    )
+    parser.add_argument(
+        "--min-data-rows",
+        type=int,
+        default=int(os.environ.get("ABSTEC_MIN_DATA_ROWS", "0")),
+        help=(
+            "Skip a station when its matched .dat files hold fewer than this many "
+            "usable data rows in total (default: 0 = no minimum)."
+        ),
+    )
+    parser.add_argument(
+        "--strict-dat-validation",
+        action="store_true",
+        help=(
+            "Treat malformed .dat rows as a reason to skip the station instead of "
+            "only warning. absolTEC reads these files with a fixed Fortran format and "
+            "aborts on a stray non-numeric line."
+        ),
+    )
+    parser.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=int(os.environ.get("ABSTEC_MAX_CONSECUTIVE_FAILURES", "25")),
+        help=(
+            "Abort the batch after this many stations fail in a row, which indicates a "
+            "systemic problem rather than bad data (default: 25; 0 disables the check)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1286,90 +1677,76 @@ def main() -> None:
                 "Is the shared jobs volume mounted (see docker-compose.dockur.yml)?"
             )
 
+    jobs = max(1, args.jobs)
+    if jobs > 1:
+        if args.runner != "dockur":
+            raise ValueError(
+                f"--jobs {jobs} is only supported with --runner dockur. The wine/direct "
+                "runners share one workdir and one absolTEC.dia, so concurrent runs would "
+                "overwrite each other's inputs and results."
+            )
+        if not args.dry_run and dockur_jobs_dir is not None:
+            slots = read_dockur_watcher_slots(dockur_jobs_dir)
+            if slots is None:
+                logger.warning(
+                    "The XP guest watcher does not report its slot count, so it is "
+                    "probably the older serial version: jobs will queue and run one at "
+                    "a time regardless of --jobs %s. Update dockur/oem/watcher.bat in "
+                    "the guest to enable real concurrency.",
+                    jobs,
+                )
+            elif slots < jobs:
+                logger.warning(
+                    "The XP guest watcher exposes %s slot(s) but --jobs is %s; the extra "
+                    "jobs will simply queue. Raise ABSTEC_WATCHER_SLOTS (and the guest's "
+                    "CPU_CORES) to run more at once.",
+                    slots,
+                    jobs,
+                )
+
+    def run_station(day_of_year: int, site: str) -> str:
+        return run_single_station(
+            workdir=workdir,
+            dia_path=dia_path,
+            exe_path=exe_path,
+            dat_path_obj=dat_path_obj,
+            output_dir=resolved_output_dir,
+            year=args.year,
+            day_of_year=day_of_year,
+            site=site,
+            elevation_cutoff=args.elevation_cutoff,
+            time_step_hours=args.time_step_hours,
+            correction_coefficient=args.correction_coefficient,
+            dry_run=args.dry_run,
+            runner=args.runner,
+            execution_timeout_seconds=args.execution_timeout_seconds,
+            organize_by_day=True,
+            dockur_jobs_dir=dockur_jobs_dir,
+            dockur_guest_dat_path=args.dockur_guest_dat_path,
+            min_data_rows=args.min_data_rows,
+            strict_dat_validation=args.strict_dat_validation,
+            skip_existing=args.skip_existing,
+        )
+
     if args.days:
         station_run_plan = build_station_run_plan(dat_path_obj, args.year, days_to_process)
         total_runs = len(station_run_plan)
-        skipped_runs = 0
         wine_reset_every_runs = 0
-        if use_wine and platform.system() == "Linux" and not args.dry_run:
+        should_reset_wine = use_wine and platform.system() == "Linux" and not args.dry_run
+        if should_reset_wine:
             if total_runs >= 500 or len(days_to_process) > 7:
                 wine_reset_every_runs = int(os.environ.get("WINE_RESET_EVERY_RUNS", "200"))
                 wine_reset_every_runs = max(0, wine_reset_every_runs)
 
-        for run_index, (day_of_year, site) in enumerate(station_run_plan, start=1):
-            if (
-                wine_reset_every_runs
-                and run_index > 1
-                and (run_index - 1) % wine_reset_every_runs == 0
-            ):
-                logger.info(
-                    "Resetting Wine runtime after %s station runs to avoid long-batch failures.",
-                    run_index - 1,
-                )
-                reset_wine_runtime()
-
-            logger.info(
-                "Processing year=%s day=%03d site=%s (%s/%s)",
-                args.year,
-                day_of_year,
-                site,
-                run_index,
-                total_runs,
-            )
-            try:
-                run_single_station(
-                    workdir=workdir,
-                    dia_path=dia_path,
-                    exe_path=exe_path,
-                    dat_path_obj=dat_path_obj,
-                    output_dir=resolved_output_dir,
-                    year=args.year,
-                    day_of_year=day_of_year,
-                    site=site,
-                    elevation_cutoff=args.elevation_cutoff,
-                    time_step_hours=args.time_step_hours,
-                    correction_coefficient=args.correction_coefficient,
-                    dry_run=args.dry_run,
-                    runner=args.runner,
-                    execution_timeout_seconds=args.execution_timeout_seconds,
-                    organize_by_day=True,
-                    dockur_jobs_dir=dockur_jobs_dir,
-                    dockur_guest_dat_path=args.dockur_guest_dat_path,
-                )
-            except FileNotFoundError as exc:
-                skipped_runs += 1
-                logger.warning(
-                    "Skipping year=%s day=%03d site=%s due to missing input files: %s",
-                    args.year,
-                    day_of_year,
-                    site,
-                    exc,
-                )
-            except ValueError as exc:
-                skipped_runs += 1
-                logger.warning(
-                    "Skipping year=%s day=%03d site=%s due to invalid input data: %s",
-                    args.year,
-                    day_of_year,
-                    site,
-                    exc,
-                )
-            except WineStartupFailureError as exc:
-                skipped_runs += 1
-                logger.warning(
-                    "Skipping year=%s day=%03d site=%s due to Wine startup/runtime failure: %s",
-                    args.year,
-                    day_of_year,
-                    site,
-                    exc,
-                )
-                if use_wine and platform.system() == "Linux" and not args.dry_run:
-                    reset_wine_runtime()
-
-            percent = round(run_index * 100 / total_runs)
-            logger.info("Completed %s / %s", run_index, total_runs)
-            logger.info("Progress: %s%%", percent)
-
+        total_runs, skipped_runs = execute_station_runs(
+            station_run_plan,
+            run_station,
+            year=args.year,
+            jobs=jobs,
+            max_consecutive_failures=args.max_consecutive_failures,
+            wine_reset_every_runs=wine_reset_every_runs,
+            reset_wine=reset_wine_runtime if should_reset_wine else None,
+        )
         logger.info(
             "Batch run complete. Total station runs: %s, skipped: %s",
             total_runs,
@@ -1380,86 +1757,21 @@ def main() -> None:
     if "," in args.site:
         sites_to_process = parse_sites_list(args.site)
         total_runs = len(sites_to_process)
-        skipped_runs = 0
         wine_reset_every_runs = 0
-        if use_wine and platform.system() == "Linux" and total_runs >= 500 and not args.dry_run:
+        should_reset_wine = use_wine and platform.system() == "Linux" and not args.dry_run
+        if should_reset_wine and total_runs >= 500:
             wine_reset_every_runs = int(os.environ.get("WINE_RESET_EVERY_RUNS", "200"))
             wine_reset_every_runs = max(0, wine_reset_every_runs)
 
-        for run_index, site in enumerate(sites_to_process, start=1):
-            if (
-                wine_reset_every_runs
-                and run_index > 1
-                and (run_index - 1) % wine_reset_every_runs == 0
-            ):
-                logger.info(
-                    "Resetting Wine runtime after %s station runs to avoid long-batch failures.",
-                    run_index - 1,
-                )
-                reset_wine_runtime()
-
-            logger.info(
-                "Processing year=%s day=%03d site=%s (%s/%s)",
-                args.year,
-                args.day_of_year,
-                site,
-                run_index,
-                total_runs,
-            )
-            try:
-                run_single_station(
-                    workdir=workdir,
-                    dia_path=dia_path,
-                    exe_path=exe_path,
-                    dat_path_obj=dat_path_obj,
-                    output_dir=resolved_output_dir,
-                    year=args.year,
-                    day_of_year=args.day_of_year,
-                    site=site,
-                    elevation_cutoff=args.elevation_cutoff,
-                    time_step_hours=args.time_step_hours,
-                    correction_coefficient=args.correction_coefficient,
-                    dry_run=args.dry_run,
-                    runner=args.runner,
-                    execution_timeout_seconds=args.execution_timeout_seconds,
-                    organize_by_day=True,
-                    dockur_jobs_dir=dockur_jobs_dir,
-                    dockur_guest_dat_path=args.dockur_guest_dat_path,
-                )
-            except FileNotFoundError as exc:
-                skipped_runs += 1
-                logger.warning(
-                    "Skipping year=%s day=%03d site=%s due to missing input files: %s",
-                    args.year,
-                    args.day_of_year,
-                    site,
-                    exc,
-                )
-            except ValueError as exc:
-                skipped_runs += 1
-                logger.warning(
-                    "Skipping year=%s day=%03d site=%s due to invalid input data: %s",
-                    args.year,
-                    args.day_of_year,
-                    site,
-                    exc,
-                )
-            except WineStartupFailureError as exc:
-                skipped_runs += 1
-                logger.warning(
-                    "Skipping year=%s day=%03d site=%s due to Wine startup/runtime failure: %s",
-                    args.year,
-                    args.day_of_year,
-                    site,
-                    exc,
-                )
-                if use_wine and platform.system() == "Linux" and not args.dry_run:
-                    reset_wine_runtime()
-
-            percent = round(run_index * 100 / total_runs)
-            logger.info("Completed %s / %s", run_index, total_runs)
-            logger.info("Progress: %s%%", percent)
-
+        total_runs, skipped_runs = execute_station_runs(
+            [(args.day_of_year, site) for site in sites_to_process],
+            run_station,
+            year=args.year,
+            jobs=jobs,
+            max_consecutive_failures=args.max_consecutive_failures,
+            wine_reset_every_runs=wine_reset_every_runs,
+            reset_wine=reset_wine_runtime if should_reset_wine else None,
+        )
         logger.info(
             "Multi-station run complete. Total station runs: %s, skipped: %s",
             total_runs,
@@ -1467,25 +1779,7 @@ def main() -> None:
         )
         return
 
-    run_single_station(
-        workdir=workdir,
-        dia_path=dia_path,
-        exe_path=exe_path,
-        dat_path_obj=dat_path_obj,
-        output_dir=resolved_output_dir,
-        year=args.year,
-        day_of_year=args.day_of_year,
-        site=args.site.strip(),
-        elevation_cutoff=args.elevation_cutoff,
-        time_step_hours=args.time_step_hours,
-        correction_coefficient=args.correction_coefficient,
-        dry_run=args.dry_run,
-        runner=args.runner,
-        execution_timeout_seconds=args.execution_timeout_seconds,
-        organize_by_day=True,
-        dockur_jobs_dir=dockur_jobs_dir,
-        dockur_guest_dat_path=args.dockur_guest_dat_path,
-    )
+    run_station(args.day_of_year, args.site.strip())
     logger.info("Completed 1 / 1")
     logger.info("Progress: 100%")
 
