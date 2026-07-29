@@ -46,3 +46,8 @@ in
 
 # .zip
 *.zip
+
+# Local secrets / environment (keep the example template tracked)
+.env
+.env.*
+!.env.example
