@@ -73,11 +73,17 @@ finished_at,year,day_of_year,site,status,reason,duration_seconds
 2026-07-22T12:42:08,2025,008,kudi,failed-runtime,RuntimeError: absolTEC exited with code 64...,3.1
 ```
 
-A resumed run reads it and skips stations recorded as `ok` or `skipped-existing`.
+A run with `--skip-existing` reads it and skips stations recorded as `ok` or
+`skipped-existing`, on top of stations whose output folder already exists.
 Failures and bad-input skips are **not** treated as final, so re-exported data
-gets another chance. This is stricter than `--skip-existing`, which infers state
-from output folders and therefore cannot tell "produced no output" apart from
-"never attempted" — those stations are retried on every resume forever.
+gets another chance. The manifest is what lets a resume skip stations that
+legitimately produce no output: the output folders alone cannot tell those apart
+from stations never attempted.
+
+Without `--skip-existing` earlier rows are not read and every station is
+processed again (its new outcome is still recorded). An `ok` row only means
+absolTEC exited cleanly, not that its output is usable, so rerunning a bad
+result must not be silently skipped.
 
 `analyze_manifest.py` summarises a finished run:
 

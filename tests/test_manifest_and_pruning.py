@@ -9,6 +9,7 @@ from run_absoltec import (
     DOCKUR_STAGE_DIR_NAME,
     RunManifest,
     execute_station_runs,
+    open_run_manifest,
     prune_dockur_artifacts,
 )
 
@@ -142,6 +143,49 @@ class ManifestResumeTests(unittest.TestCase):
             )
 
             self.assertEqual(retried, ["st02"])
+
+
+class OpenRunManifestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.out = Path(self._tmp.name)
+        RunManifest(self.out / "_manifest.csv").record(year=2026, day_of_year=100, site="chrn", status="ok")
+
+    def _run(self, manifest: RunManifest | None) -> list[str]:
+        seen: list[str] = []
+        execute_station_runs(
+            [(100, "chrn")],
+            lambda d, s: (seen.append(s), "ok")[1],
+            year=2026, jobs=1, max_consecutive_failures=0, manifest=manifest,
+        )
+        return seen
+
+    def test_completed_station_is_processed_again_without_skip_existing(self) -> None:
+        # An "ok" row means absolTEC exited cleanly, not that its output was usable,
+        # so a rerun the user asked for must not be skipped.
+        manifest = open_run_manifest(None, self.out, resume=False)
+
+        self.assertEqual(self._run(manifest), ["chrn"])
+        with (self.out / "_manifest.csv").open(encoding="utf-8", newline="") as handle:
+            statuses = [row["status"] for row in csv.DictReader(handle)]
+        self.assertEqual(statuses, ["ok", "ok"])
+
+    def test_completed_station_is_skipped_with_skip_existing(self) -> None:
+        manifest = open_run_manifest(None, self.out, resume=True)
+
+        self.assertEqual(self._run(manifest), [])
+
+    def test_explicit_path_wins_over_the_output_dir(self) -> None:
+        other = self.out / "elsewhere.csv"
+        manifest = open_run_manifest(other, self.out, resume=True)
+
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest.path, other)
+        self.assertEqual(self._run(manifest), ["chrn"])
+
+    def test_no_path_and_no_output_dir_means_no_manifest(self) -> None:
+        self.assertIsNone(open_run_manifest(None, None, resume=True))
 
 
 class PruneDockurArtifactsTests(unittest.TestCase):
