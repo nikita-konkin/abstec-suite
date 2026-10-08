@@ -1714,6 +1714,43 @@ class RunManifest:
                 logger.warning("Could not write manifest row for %s: %s", site, exc)
 
 
+def open_run_manifest(
+    manifest_path: str | Path | None,
+    output_dir: Path | None,
+    *,
+    resume: bool,
+) -> RunManifest | None:
+    """Open the manifest that records this run; read earlier outcomes only when resuming.
+
+    Earlier outcomes make stations count as done, so they are read only for
+    --skip-existing. Without it the user asked for the stations to be processed
+    again, and an "ok" row says only that absolTEC exited cleanly, not that its
+    output is usable: a rerun of a bad result must not be skipped silently.
+    """
+    if not manifest_path and output_dir is not None:
+        manifest_path = output_dir / "_manifest.csv"
+    if not manifest_path:
+        return None
+    manifest = RunManifest(Path(manifest_path))
+    if not resume:
+        logger.info(
+            "Recording per-station outcomes to %s; earlier outcomes are not read "
+            "without --skip-existing, so every station is processed.",
+            manifest.path,
+        )
+        return manifest
+    previous_rows = manifest.load()
+    if previous_rows:
+        logger.info(
+            "Loaded %s previous run record(s) from %s; completed stations will be skipped.",
+            previous_rows,
+            manifest.path,
+        )
+    else:
+        logger.info("Recording per-station outcomes to %s", manifest.path)
+    return manifest
+
+
 def prune_dockur_artifacts(
     jobs_dir: Path | None,
     output_dir: Path | None,
@@ -2021,8 +2058,10 @@ def parse_args() -> argparse.Namespace:
         "--skip-existing",
         action="store_true",
         help=(
-            "Skip stations whose output folder already exists and is non-empty, so an "
-            "interrupted batch can be restarted without redoing completed stations."
+            "Skip stations whose output folder already exists and is non-empty, or that "
+            "the run manifest records as completed, so an interrupted batch can be "
+            "restarted without redoing completed stations. Without it every selected "
+            "station is processed again."
         ),
     )
     parser.add_argument(
@@ -2060,8 +2099,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             "CSV file recording the outcome of every station (status, reason, "
             "duration). Defaults to <output-dir>/_manifest.csv when --output-dir is "
-            "set. A resumed run reads it and skips stations already completed, which "
-            "--skip-existing cannot do for stations that legitimately produce no output."
+            "set. With --skip-existing a resumed run also reads it and skips stations "
+            "already completed, which the output folders alone cannot show for stations "
+            "that legitimately produce no output."
         ),
     )
     parser.add_argument(
@@ -2171,20 +2211,7 @@ def main() -> None:
 
     manifest: RunManifest | None = None
     if not args.no_manifest:
-        manifest_path = args.manifest
-        if not manifest_path and resolved_output_dir is not None:
-            manifest_path = resolved_output_dir / "_manifest.csv"
-        if manifest_path:
-            manifest = RunManifest(Path(manifest_path))
-            previous_rows = manifest.load()
-            if previous_rows:
-                logger.info(
-                    "Loaded %s previous run record(s) from %s; completed stations will be skipped.",
-                    previous_rows,
-                    manifest.path,
-                )
-            else:
-                logger.info("Recording per-station outcomes to %s", manifest.path)
+        manifest = open_run_manifest(args.manifest, resolved_output_dir, resume=args.skip_existing)
 
     if args.runner == "dockur" and not args.dry_run:
         prune_dockur_artifacts(dockur_jobs_dir, resolved_output_dir, args.job_retention_hours)
