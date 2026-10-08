@@ -96,6 +96,33 @@ Useful options:
 - `--correction-coefficient 0.97`
 - `--output-dir out` (move generated results from workdir into a dedicated folder)
 - `--dry-run` (updates `.dia` only, skips `.exe` execution)
+- `--clean-input` (see below)
+
+### Cleaning the input (`--clean-input`)
+
+tec-suite writes `0.000` as the phase TEC (`tec.l1l2`) of epochs without phase. At
+some stations those rows sit inside phase arcs, where absolTEC reads each one as a
+jump to zero and back, and its fit fails for the whole station: a receiver DCB in
+the millions and result rows of `0.000`. `--clean-input` runs absolTEC on a copy of
+the station's files without those rows and without repeated epochs:
+
+- every `.dat` in the station folder is cleaned, `__dup` sessions included, since
+  absolTEC reads them all; a file left without data rows is omitted, because
+  absolTEC fails the whole station on one;
+- rows with zero *code* TEC are kept: absolTEC levels phase with code from other
+  satellites, and at some stations code arrives only on satellites without phase.
+  If cleaning would leave no code at all, only the raw input is run;
+- when the cleaned result is not complete, the raw input is run too and the result
+  with more solved half-hours is kept, so no station ends up worse than without
+  the option. Needs `--output-dir`.
+
+The copy lives in a temporary folder, or for `--runner dockur` inside the job
+folder (`W:\jobs\<job>\in`), and is deleted with it. On 163 station-days
+(2026/100 and 2025/050) this took 21 stations to a complete result.
+
+absolTEC truncates input file paths at about 120 characters, and a cut-off
+`__dup1.dat` name makes it create and read an empty file. Keep `--dat-path` (and
+the temporary folder) short when running locally.
 
 ### 1b. Run all stations for multiple days
 

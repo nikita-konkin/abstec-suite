@@ -12,6 +12,7 @@ import re
 import signal
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -494,6 +495,104 @@ def validate_dat_inputs(
     return station_folder
 
 
+# absolTEC treats every row of a satellite file as a measurement. tec-suite writes
+# 0.000 as the phase TEC of epochs without phase, and at some stations those rows
+# sit inside phase arcs, where each reads as a jump to zero and back; the fit then
+# fails for the whole station (receiver DCB in the millions, TEC rows of 0.000).
+# Dropping them, on 163 station-days of 2026/100 and 2025/050, took 21 stations to
+# a complete result and made 3 worse, so --clean-input follows a cleaned run that
+# is not complete with a raw one and keeps the better result.
+DAT_PHASE_COLUMN = 4
+
+
+def clean_dat_text(text: str) -> tuple[str, int, int]:
+    """Drop phase placeholders (tec.l1l2 of 0.000) and repeated epochs from one .dat file.
+
+    Returns (text, data rows kept, rows dropped). Header lines and kept rows are
+    copied unchanged, since absolTEC reads them with a fixed Fortran format.
+    """
+    kept: list[str] = []
+    rows = dropped = 0
+    previous_tsn: str | None = None
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped or _is_dat_header_line(stripped):
+            kept.append(line)
+            continue
+        parts = stripped.split()
+        try:
+            phase = float(parts[DAT_PHASE_COLUMN])
+        except (IndexError, ValueError):
+            # Malformed rows are validate_dat_inputs' concern; pass them through.
+            kept.append(line)
+            rows += 1
+            continue
+        if phase == 0.0 or parts[0] == previous_tsn:
+            dropped += 1
+            continue
+        previous_tsn = parts[0]
+        kept.append(line)
+        rows += 1
+    return "".join(kept), rows, dropped
+
+
+def _has_code_tec(text: str) -> bool:
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != DAT_DATA_COLUMNS or _is_dat_header_line(line.strip()):
+            continue
+        try:
+            if float(parts[DAT_BIAS_COLUMN]) != 0.0:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def stage_clean_station_input(station_folder: Path, destination: Path) -> int | None:
+    """Write cleaned copies of a station's .dat files (``__dup`` sessions included) to destination.
+
+    Returns the number of rows dropped, or None when a cleaned run is not worth it:
+    nothing was dropped, or no file keeps any code TEC (tec.c1p2). absolTEC needs
+    code for the absolute level, and at some stations it comes only from satellites
+    without phase, which cleaning removes entirely. A file left without data rows is
+    omitted, because absolTEC fails the whole station on one.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    dropped_total = 0
+    has_code = False
+    for dat_file in sorted(station_folder.glob("*.dat")):
+        # latin-1 round-trips any byte, so kept lines are written back exactly.
+        text, rows, dropped = clean_dat_text(dat_file.read_bytes().decode("latin-1"))
+        dropped_total += dropped
+        if rows == 0:
+            continue
+        has_code = has_code or _has_code_tec(text)
+        (destination / dat_file.name).write_bytes(text.encode("latin-1"))
+    if dropped_total == 0 or not has_code:
+        return None
+    return dropped_total
+
+
+def count_solved_rows(station_output: Path) -> int:
+    """Half-hours absolTEC solved: rows of the station's result file whose TEC is not 0.000."""
+    solved = 0
+    if not station_output.is_dir():
+        return 0
+    for result in station_output.glob("*.dat"):
+        if result.name.startswith("DCB_"):
+            continue
+        for line in result.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split()
+            if len(parts) < 2 or line.lstrip().startswith("#"):
+                continue
+            try:
+                solved += float(parts[1]) != 0.0
+            except ValueError:
+                continue
+    return solved
+
+
 def find_wine_binary() -> str | None:
     wine_path = shutil.which("wine") or shutil.which("wine64")
     if wine_path:
@@ -883,6 +982,14 @@ def rename_station_output(output_dir: Path, year: int, site: str) -> Path | None
     return None
 
 
+def station_output_dir(
+    output_dir: Path, year: int, day_of_year: int, site: str, organize_by_day: bool
+) -> Path:
+    if organize_by_day:
+        return output_dir / str(year) / f"{day_of_year:03d}" / site
+    return output_dir / str(year) / site
+
+
 def station_output_exists(
     output_dir: Path, year: int, day_of_year: int, site: str, organize_by_day: bool
 ) -> bool:
@@ -891,10 +998,7 @@ def station_output_exists(
     Used by --skip-existing so an interrupted batch can be restarted without
     redoing the stations it already completed.
     """
-    if organize_by_day:
-        destination = output_dir / str(year) / f"{day_of_year:03d}" / site
-    else:
-        destination = output_dir / str(year) / site
+    destination = station_output_dir(output_dir, year, day_of_year, site, organize_by_day)
     return destination.is_dir() and any(destination.iterdir())
 
 
@@ -949,6 +1053,8 @@ def move_absoltec_results(
 DOCKUR_DEFAULT_GUEST_DAT_PATH = "W:\\in\\"
 DOCKUR_GUEST_WORKDIR = "C:\\absoltec\\work"
 DOCKUR_GUEST_OUT_ROOT = "W:\\out"
+# The shared jobs folder as the guest sees it (watcher.bat's %DRIVE%\jobs).
+DOCKUR_GUEST_JOBS_ROOT = "W:\\jobs"
 DOCKUR_KILL_GRACE_SECONDS = 30.0
 
 # Per-job staging folder under the shared output root. absolTEC always names
@@ -1022,17 +1128,32 @@ def read_dockur_watcher_slots(jobs_dir: Path) -> int | None:
     return slots if slots > 0 else None
 
 
-def submit_dockur_job(jobs_dir: Path, dia_content: str, year: int, label: str) -> Path:
+def replace_dia_dat_path(dia_content: str, dat_path: str) -> str:
+    """Point an absolTEC.dia at another input root (its first line)."""
+    lines = dia_content.split("\n")
+    lines[0] = normalize_dat_path(dat_path)
+    return "\n".join(lines)
+
+
+def submit_dockur_job(
+    jobs_dir: Path, dia_content: str, year: int, label: str, input_root: Path | None = None
+) -> Path:
     """Create a job folder in the shared jobs directory and mark it ready.
 
     job.ready is written last so the guest watcher never picks up a
-    half-written job over SMB.
+    half-written job over SMB. With input_root, that YYYY/DDD/SITE tree is
+    copied into the job folder and absolTEC.dia points the guest at it, so
+    input the host prepared (e.g. --clean-input) never touches the shared
+    input folder and leaves with the job folder.
     """
     jobs_dir.mkdir(parents=True, exist_ok=True)
     safe_label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
     job_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{safe_label}_{os.urandom(4).hex()}"
     job_dir = jobs_dir / job_name
     job_dir.mkdir()
+    if input_root is not None:
+        shutil.copytree(input_root, job_dir / "in")
+        dia_content = replace_dia_dat_path(dia_content, f"{DOCKUR_GUEST_JOBS_ROOT}\\{job_name}\\in")
     (job_dir / "absolTEC.dia").write_text(dia_content, encoding="utf-8")
     (job_dir / "job.bat").write_bytes(build_dockur_job_bat(year, job_name).encode("ascii"))
     (job_dir / "job.ready").write_text("ready\n", encoding="ascii")
@@ -1204,8 +1325,9 @@ def run_absoltec_dockur(
     label: str,
     timeout_seconds: float | None,
     ack_grace_seconds: float = 15.0,
+    input_root: Path | None = None,
 ) -> str:
-    job_dir = submit_dockur_job(jobs_dir, dia_content, year, label)
+    job_dir = submit_dockur_job(jobs_dir, dia_content, year, label, input_root=input_root)
     logger.info("Submitted dockur job: %s", job_dir.name)
     exit_code, output = wait_for_dockur_job(job_dir, timeout_seconds)
 
@@ -1237,6 +1359,91 @@ def run_absoltec_dockur(
     return job_dir.name
 
 
+def _set_aside(folder: Path, hold_dir: Path, tag: str) -> Path | None:
+    if not folder.is_dir():
+        return None
+    hold_dir.mkdir(parents=True, exist_ok=True)
+    held = hold_dir / f"_{tag}_{folder.name}_{os.urandom(4).hex()}"
+    folder.rename(held)
+    return held
+
+
+def _put_back(held: Path | None, folder: Path) -> None:
+    if held is None:
+        return
+    if folder.exists():
+        shutil.rmtree(folder)
+    held.rename(folder)
+
+
+def _discard(held: Path | None) -> None:
+    if held is not None:
+        shutil.rmtree(held, ignore_errors=True)
+
+
+def run_cleaned_then_raw(
+    run_once: Callable[[bool], None],
+    *,
+    destination: Path,
+    hold_dir: Path,
+    expected_rows: int,
+    label: str,
+    after_failure: Callable[[], None] = lambda: None,
+) -> str:
+    """Run absolTEC on the cleaned input, then on the raw one unless that was complete.
+
+    run_once(True) runs the cleaned input and run_once(False) the raw one; both
+    leave their result in destination. Keeps whichever solved more half-hours
+    (the cleaned one on a tie) and returns "cleaned" or "raw". Results being
+    compared wait in hold_dir, and an earlier run's result in destination is put
+    back only if neither run produces one, as a plain rerun would leave it.
+    """
+    previous = _set_aside(destination, hold_dir, "previous")
+    try:
+        try:
+            run_once(True)
+            cleaned = count_solved_rows(destination)
+        except RuntimeError as exc:
+            logger.warning("absolTEC failed on the cleaned input for %s (%s); trying the raw input.", label, exc)
+            after_failure()
+            cleaned = -1
+        if cleaned >= expected_rows:
+            logger.info("Cleaned input for %s solved %s of %s half-hours.", label, cleaned, expected_rows)
+            return "cleaned"
+
+        held_cleaned = _set_aside(destination, hold_dir, "cleaned")
+        try:
+            run_once(False)
+        except RuntimeError as exc:
+            if held_cleaned is None:
+                raise
+            after_failure()
+            _put_back(held_cleaned, destination)
+            logger.warning("absolTEC failed on the raw input for %s (%s); keeping the cleaned result.", label, exc)
+            return "cleaned"
+        raw = count_solved_rows(destination)
+        if held_cleaned is not None and cleaned >= raw:
+            _put_back(held_cleaned, destination)
+            kept = "cleaned"
+        else:
+            _discard(held_cleaned)
+            kept = "raw"
+        logger.info(
+            "Kept the %s input's result for %s: %s half-hours solved from cleaned input, %s from raw, of %s.",
+            kept,
+            label,
+            max(cleaned, 0),
+            raw,
+            expected_rows,
+        )
+        return kept
+    finally:
+        if destination.is_dir():
+            _discard(previous)
+        else:
+            _put_back(previous, destination)
+
+
 def run_single_station(
     *,
     workdir: Path,
@@ -1259,6 +1466,7 @@ def run_single_station(
     min_data_rows: int = 0,
     strict_dat_validation: bool = False,
     skip_existing: bool = False,
+    clean_input: bool = False,
 ) -> str:
     if skip_existing and output_dir and station_output_exists(
         output_dir, year, day_of_year, site, organize_by_day
@@ -1271,7 +1479,7 @@ def run_single_station(
         )
         return "skipped-existing"
 
-    validate_dat_inputs(
+    station_folder = validate_dat_inputs(
         dat_path_obj,
         site,
         day_of_year,
@@ -1280,99 +1488,138 @@ def run_single_station(
         strict=strict_dat_validation,
     )
 
-    dat_path_for_dia = str(dat_path_obj)
-    if runner == "dockur":
-        dat_path_for_dia = dockur_guest_dat_path
-    elif should_use_wine(exe_path, runner):
-        dat_path_for_dia = to_wine_windows_path(str(dat_path_obj))
-
-    dia_content = build_dia_content(
-        dat_path=dat_path_for_dia,
-        elevation_cutoff=elevation_cutoff,
-        year=year,
-        day_of_year=day_of_year,
-        site=site,
-        time_step_hours=time_step_hours,
-        correction_coefficient=correction_coefficient,
-    )
-    if runner == "dockur":
-        # Every dockur job carries its own absolTEC.dia inside the job folder,
-        # so the shared workdir copy is unused — and writing it here would race
-        # between concurrent jobs.
-        logger.info(
-            "Prepared absolTEC.dia for year=%s day=%03d site=%s: %s",
-            year,
-            day_of_year,
-            site,
-            dia_content.replace("\n", " | ").strip(" |"),
-        )
-    else:
-        dia_path.write_text(dia_content, encoding="utf-8")
-        logger.info("Updated: %s", dia_path)
-
-    if dry_run:
-        logger.info("Dry run enabled. Skipping absolTEC.exe execution.")
-        return "dry-run"
-
     timeout_seconds: float | None = execution_timeout_seconds
     if timeout_seconds is not None and timeout_seconds <= 0:
         timeout_seconds = None
 
-    if runner == "dockur":
-        if dockur_jobs_dir is None:
-            raise ValueError("--dockur-jobs-dir is required when --runner dockur is used")
-        job_name = run_absoltec_dockur(
-            jobs_dir=dockur_jobs_dir,
-            dia_content=dia_content,
+    def run_once(staged_root: Path | None) -> None:
+        """One absolTEC run on the configured input, or on a staged YYYY/DDD/SITE tree."""
+        dat_path_for_dia = str(staged_root or dat_path_obj)
+        if runner == "dockur":
+            # Staged input travels inside the job folder; submit_dockur_job repoints the .dia.
+            dat_path_for_dia = dockur_guest_dat_path
+        elif should_use_wine(exe_path, runner):
+            dat_path_for_dia = to_wine_windows_path(dat_path_for_dia)
+
+        dia_content = build_dia_content(
+            dat_path=dat_path_for_dia,
+            elevation_cutoff=elevation_cutoff,
             year=year,
-            label=f"{year}_{day_of_year:03d}_{site}",
-            timeout_seconds=timeout_seconds,
+            day_of_year=day_of_year,
+            site=site,
+            time_step_hours=time_step_hours,
+            correction_coefficient=correction_coefficient,
         )
-        logger.info("Finished dockur job: year=%s day=%03d site=%s", year, day_of_year, site)
-        # The guest stages workdir\<year> under <out>\_stage\<job>, so this run's
-        # results are picked up by job name instead of by scanning the shared
-        # year folder that every other job also writes into.
-        if output_dir:
-            organized = collect_dockur_stage_output(
-                output_dir, job_name, year, day_of_year, site, organize_by_day
-            )
-            if organized:
-                logger.info("Organized station output under day folder: %s", organized)
-            else:
-                logger.warning(
-                    "absolTEC produced no output for year=%s day=%03d site=%s "
-                    "(nothing staged under %s). The guest run itself succeeded, so "
-                    "either the station's DAT input yielded no usable arcs, or the "
-                    "XP VM's /shared/out mount does not point at --output-dir.",
-                    year,
-                    day_of_year,
-                    site,
-                    Path(output_dir) / DOCKUR_STAGE_DIR_NAME / job_name,
-                )
-        return "ok"
-
-    before_state = capture_workdir_state(workdir) if output_dir else {}
-    run_absoltec(exe_path, runner, timeout_seconds=timeout_seconds)
-    logger.info("Finished: %s", exe_path)
-
-    if output_dir:
-        moved_paths = move_absoltec_results(workdir, output_dir, year, before_state)
-        if moved_paths:
+        if runner == "dockur":
+            # Every dockur job carries its own absolTEC.dia inside the job folder,
+            # so the shared workdir copy is unused — and writing it here would race
+            # between concurrent jobs.
             logger.info(
-                "Moved result paths to output directory: %s",
-                ", ".join(str(path) for path in moved_paths),
+                "Prepared absolTEC.dia for year=%s day=%03d site=%s: %s",
+                year,
+                day_of_year,
+                site,
+                dia_content.replace("\n", " | ").strip(" |"),
             )
         else:
-            logger.info("No generated result files were detected to move.")
-        renamed = rename_station_output(output_dir, year, site)
-        if renamed:
-            logger.info("Renamed station output folder to: %s", renamed)
-        if organize_by_day:
-            organized = organize_station_output_by_day(output_dir, year, day_of_year, site)
-            if organized:
-                logger.info("Organized station output under day folder: %s", organized)
+            dia_path.write_text(dia_content, encoding="utf-8")
+            logger.info("Updated: %s", dia_path)
 
-    return "ok"
+        if dry_run:
+            logger.info("Dry run enabled. Skipping absolTEC.exe execution.")
+            return
+
+        if runner == "dockur":
+            if dockur_jobs_dir is None:
+                raise ValueError("--dockur-jobs-dir is required when --runner dockur is used")
+            job_name = run_absoltec_dockur(
+                jobs_dir=dockur_jobs_dir,
+                dia_content=dia_content,
+                year=year,
+                label=f"{year}_{day_of_year:03d}_{site}",
+                timeout_seconds=timeout_seconds,
+                input_root=staged_root,
+            )
+            logger.info("Finished dockur job: year=%s day=%03d site=%s", year, day_of_year, site)
+            # The guest stages workdir\<year> under <out>\_stage\<job>, so this run's
+            # results are picked up by job name instead of by scanning the shared
+            # year folder that every other job also writes into.
+            if output_dir:
+                organized = collect_dockur_stage_output(
+                    output_dir, job_name, year, day_of_year, site, organize_by_day
+                )
+                if organized:
+                    logger.info("Organized station output under day folder: %s", organized)
+                else:
+                    logger.warning(
+                        "absolTEC produced no output for year=%s day=%03d site=%s "
+                        "(nothing staged under %s). The guest run itself succeeded, so "
+                        "either the station's DAT input yielded no usable arcs, or the "
+                        "XP VM's /shared/out mount does not point at --output-dir.",
+                        year,
+                        day_of_year,
+                        site,
+                        Path(output_dir) / DOCKUR_STAGE_DIR_NAME / job_name,
+                    )
+            return
+
+        before_state = capture_workdir_state(workdir) if output_dir else {}
+        run_absoltec(exe_path, runner, timeout_seconds=timeout_seconds)
+        logger.info("Finished: %s", exe_path)
+
+        if output_dir:
+            moved_paths = move_absoltec_results(workdir, output_dir, year, before_state)
+            if moved_paths:
+                logger.info(
+                    "Moved result paths to output directory: %s",
+                    ", ".join(str(path) for path in moved_paths),
+                )
+            else:
+                logger.info("No generated result files were detected to move.")
+            renamed = rename_station_output(output_dir, year, site)
+            if renamed:
+                logger.info("Renamed station output folder to: %s", renamed)
+            if organize_by_day:
+                organized = organize_station_output_by_day(output_dir, year, day_of_year, site)
+                if organized:
+                    logger.info("Organized station output under day folder: %s", organized)
+
+    if dry_run or not clean_input:
+        run_once(None)
+        return "dry-run" if dry_run else "ok"
+    if output_dir is None:
+        logger.warning("--clean-input needs --output-dir to compare results; running the raw input only.")
+        run_once(None)
+        return "ok"
+
+    label = f"year={year} day={day_of_year:03d} site={site}"
+    staging = Path(tempfile.mkdtemp(prefix="abstec_in_"))
+    try:
+        staged_station = staging / str(year) / f"{day_of_year:03d}" / station_folder.name
+        dropped = stage_clean_station_input(station_folder, staged_station)
+        if dropped is None:
+            logger.info("Running the raw input for %s: cleaning would drop nothing or leave no code TEC.", label)
+            run_once(None)
+            return "ok"
+        logger.info("Cleaned input for %s: dropped %s placeholder or repeated row(s).", label, dropped)
+
+        def discard_partial_results() -> None:
+            # A failed direct/wine run can leave workdir/<year> behind, which the
+            # next run would otherwise move out as its own result.
+            if runner != "dockur":
+                shutil.rmtree(workdir / str(year), ignore_errors=True)
+
+        run_cleaned_then_raw(
+            lambda cleaned: run_once(staging if cleaned else None),
+            destination=station_output_dir(output_dir, year, day_of_year, site, organize_by_day),
+            hold_dir=output_dir / DOCKUR_STAGE_DIR_NAME,
+            expected_rows=round(24 / time_step_hours),
+            label=label,
+            after_failure=discard_partial_results,
+        )
+        return "ok"
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 MANIFEST_FIELDS = (
@@ -1779,6 +2026,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--clean-input",
+        action="store_true",
+        help=(
+            "Run absolTEC on a copy of each station's .dat files without phase "
+            "placeholders (tec.l1l2 of 0.000) and repeated epochs, which make its fit "
+            "fail at some stations. When that result is not complete the raw input is "
+            "run too, and the result with more solved half-hours is kept, so a station "
+            "never ends up worse than without this option. Needs --output-dir."
+        ),
+    )
+    parser.add_argument(
         "--min-data-rows",
         type=int,
         default=int(os.environ.get("ABSTEC_MIN_DATA_ROWS", "0")),
@@ -1953,6 +2211,7 @@ def main() -> None:
             min_data_rows=args.min_data_rows,
             strict_dat_validation=args.strict_dat_validation,
             skip_existing=args.skip_existing,
+            clean_input=args.clean_input,
         )
 
     if args.days:
