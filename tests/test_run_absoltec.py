@@ -11,6 +11,7 @@ from run_absoltec import (
     WineStartupFailureError,
     _is_wine_process_name,
     build_dia_content,
+    build_station_run_plan,
     capture_workdir_state,
     discover_stations_for_day,
     extract_progress_counters,
@@ -124,6 +125,19 @@ class RunAbsoltecTests(unittest.TestCase):
             dat_root = Path(temp_dir)
             stations = discover_stations_for_day(dat_root, 2026, 1)
             self.assertEqual(stations, [])
+
+    def test_build_station_run_plan_keeps_only_requested_sites_in_any_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dat_root = Path(temp_dir)
+            for day in ("122", "123"):
+                for site in ("mork", "ntor", "octb"):
+                    (dat_root / "2024" / day / site).mkdir(parents=True)
+            plan = build_station_run_plan(dat_root, 2024, [122, 123], ["NTOR", "mork"])
+            self.assertEqual(
+                plan,
+                [(122, "mork"), (122, "ntor"), (123, "mork"), (123, "ntor")],
+                "Batch plan did not narrow the stations to the requested sites",
+            )
 
     def test_normalize_dat_path_adds_trailing_backslash(self) -> None:
         self.assertEqual(normalize_dat_path("c:\\dat"), "c:\\dat\\")
@@ -671,6 +685,56 @@ class RunAbsoltecTests(unittest.TestCase):
 
         self.assertEqual(mock_run_single_station.call_count, 3)
         self.assertEqual(mock_reset_wine_runtime.call_count, 1)
+
+    def test_main_multi_day_with_site_runs_only_those_stations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workdir = root / "work"
+            dat_path = root / "in"
+            output_dir = root / "out"
+            workdir.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            (workdir / "absolTEC.dia").write_text("x", encoding="utf-8")
+            (workdir / "absolTEC.exe").write_text("x", encoding="utf-8")
+            for day in ("122", "123", "124"):
+                for site in ("mork", "ntor", "octb"):
+                    (dat_path / "2024" / day / site).mkdir(parents=True)
+            args = Namespace(
+                workdir=str(workdir),
+                dat_path=str(dat_path),
+                year=2024,
+                day_of_year=None,
+                site="mork,ntor",
+                days="122-124",
+                elevation_cutoff=10.0,
+                time_step_hours=0.5,
+                correction_coefficient=0.97,
+                dry_run=False,
+                runner="wine",
+                execution_timeout_seconds=900,
+                output_dir=str(output_dir),
+                dockur_jobs_dir=None,
+                dockur_guest_dat_path="W:\\in\\",
+                jobs=1,
+                skip_existing=False,
+                clean_input=False,
+                min_data_rows=0,
+                strict_dat_validation=False,
+                max_consecutive_failures=25,
+                manifest=None,
+                no_manifest=True,
+                job_retention_hours=0,
+            )
+            with (
+                patch("run_absoltec.parse_args", return_value=args),
+                patch("run_absoltec.run_single_station") as mock_run_single_station,
+            ):
+                main()
+        self.assertEqual(
+            [(call.kwargs["day_of_year"], call.kwargs["site"]) for call in mock_run_single_station.call_args_list],
+            [(122, "mork"), (122, "ntor"), (123, "mork"), (123, "ntor"), (124, "mork"), (124, "ntor")],
+            "Batch run with --site did not process just the requested stations on every day",
+        )
 
     def test_main_single_day_with_csv_site_trims_and_deduplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
