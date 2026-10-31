@@ -248,10 +248,18 @@ def discover_stations_for_day(dat_root: Path, year: int, day_of_year: int) -> li
     return filtered_names
 
 
-def build_station_run_plan(dat_root: Path, year: int, days_to_process: list[int]) -> list[tuple[int, str]]:
+def build_station_run_plan(
+    dat_root: Path, year: int, days_to_process: list[int], sites: list[str] | None = None
+) -> list[tuple[int, str]]:
+    wanted = {site.lower() for site in sites} if sites else None
     plan: list[tuple[int, str]] = []
     for day_of_year in days_to_process:
         stations = discover_stations_for_day(dat_root, year, day_of_year)
+        if wanted is not None:
+            missing = wanted - {site.lower() for site in stations}
+            if missing:
+                logger.warning("Requested sites missing for %s/%03d: %s", year, day_of_year, ", ".join(sorted(missing)))
+            stations = [site for site in stations if site.lower() in wanted]
         if not stations:
             logger.warning("No station folders found for %s/%03d", year, day_of_year)
             continue
@@ -1998,7 +2006,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--site")
     parser.add_argument(
         "--days",
-        help="Comma-separated list/ranges of days (e.g. 001,002,010-015). When set, all stations for each day are processed.",
+        help="Comma-separated list/ranges of days (e.g. 001,002,010-015). When set, all stations for each day are processed, or only those named in --site.",
     )
     parser.add_argument("--time-step-hours", type=float, default=0.5)
     parser.add_argument("--correction-coefficient", type=float, default=0.97)
@@ -2139,8 +2147,6 @@ def main() -> None:
     if args.days:
         if args.day_of_year is not None:
             raise ValueError("Use either --day-of-year or --days, not both")
-        if args.site is not None:
-            raise ValueError("--site cannot be used with --days (stations are auto-discovered)")
         days_to_process = parse_days_list(args.days)
     else:
         if args.day_of_year is None:
@@ -2242,7 +2248,9 @@ def main() -> None:
         )
 
     if args.days:
-        station_run_plan = build_station_run_plan(dat_path_obj, args.year, days_to_process)
+        station_run_plan = build_station_run_plan(
+            dat_path_obj, args.year, days_to_process, parse_sites_list(args.site) if args.site else None
+        )
         total_runs = len(station_run_plan)
         wine_reset_every_runs = 0
         should_reset_wine = use_wine and platform.system() == "Linux" and not args.dry_run

@@ -145,7 +145,7 @@ python run_absoltec.py --dat-path in --year 2026 --days 001-365 --output-dir out
 Batch mode behavior:
 
 - `--days` and `--day-of-year` are mutually exclusive.
-- When `--days` is used, stations are auto-discovered from `in/YYYY/DDD/*` and `--site` is not used.
+- When `--days` is used, stations are auto-discovered from `in/YYYY/DDD/*`. Add `--site mork,ntor` to process only those stations on each listed day; a day missing one of them logs a warning.
 - The script runs `absolTEC.exe` once per discovered station for each listed day.
 - In batch mode, output is organized as `out/YYYY/DDD/STATION` (for example `out/2026/001/aksu0010`).
 
